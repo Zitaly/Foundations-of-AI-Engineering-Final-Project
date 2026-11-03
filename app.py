@@ -58,23 +58,27 @@ if "owner" not in st.session_state:
 owner: Owner = st.session_state.owner
 
 
+@st.cache_resource
+def make_llm(key: str) -> GeminiLLM:
+    """One client per key, shared by every session, so its rate pacing and reply cache cover the whole quota."""
+    return GeminiLLM(api_key=key)
+
+
 def get_llm() -> GeminiLLM | None:
-    """The Gemini client, or None if there's no API key. A successful client is kept for the session."""
-    if "llm" not in st.session_state:
-        key = get_api_key()
-        if not key:
-            try:
-                key = st.secrets.get("GEMINI_API_KEY")
-            except Exception:  # no secrets.toml
-                key = None
-        if not key:
-            return None
+    """The Gemini client, or None if there's no API key."""
+    key = get_api_key()
+    if not key:
         try:
-            st.session_state.llm = GeminiLLM(api_key=key)
-        except (LLMError, ImportError) as e:
-            st.sidebar.error(f"Gemini unavailable: {e}")
-            return None
-    return st.session_state.llm
+            key = st.secrets.get("GEMINI_API_KEY")
+        except Exception:  # no secrets.toml
+            key = None
+    if not key:
+        return None
+    try:
+        return make_llm(key)
+    except (LLMError, ImportError) as e:
+        st.sidebar.error(f"Gemini unavailable: {e}")
+        return None
 
 
 llm = get_llm()
@@ -82,6 +86,10 @@ ai_ready = llm is not None
 st.sidebar.markdown("### ✨ AI features")
 if ai_ready:
     st.sidebar.success(f"Gemini connected ({llm.model}).")
+    st.sidebar.caption(
+        f"{llm.request_count} request(s) sent, {llm.cache_hits} answered from cache. "
+        f"Paced to {llm.rpm} requests/min per model; busy models fall back to {', '.join(llm.models[1:])}."
+    )
 else:
     st.sidebar.info("AI features are off. Set GEMINI_API_KEY (environment or .streamlit/secrets.toml) and restart.")
 st.sidebar.caption("Every AI suggestion waits for your review before it changes anything.")
@@ -533,9 +541,13 @@ if proposal:
 
     show_plan(proposal.schedule)
 
-    with st.expander(f"Agent steps ({len(proposal.steps)})"):
-        for i, step in enumerate(proposal.steps, 1):
-            st.markdown(f"**{i}. {step.tool}** `{json.dumps(step.args)}`" + (f"  \n_{step.thought}_" if step.thought else ""))
+    with st.expander(f"Agent steps ({proposal.turns} model call(s), {len(proposal.steps)} action(s))"):
+        shown_turn = None
+        for step in proposal.steps:
+            if step.turn != shown_turn:
+                shown_turn = step.turn
+                st.markdown(f"**Turn {step.turn}**" + (f": _{step.thought}_" if step.thought else ""))
+            st.markdown(f"`{step.tool}` `{json.dumps(step.args)}`")
             st.code(step.result, language=None)
 
     approve_col, reject_col = st.columns(2)

@@ -131,33 +131,38 @@ class GuidelineIssue:
     ref: str
 
 
-CHECK_SYSTEM = """You audit a pet's care tasks against the owner's own numbered guidelines.
-Only report a problem when the current tasks or the history clearly break a guideline. Do not invent guidelines or facts.
-Reply with JSON: {"issues": [{"guideline": <guideline number>, "issue": "<what is wrong>", "suggestion": "<one concrete fix>"}]}
+CHECK_SYSTEM = """You audit pets' care tasks against the owner's own numbered guidelines for each pet.
+Only report a problem when a pet's current tasks or history clearly break one of that pet's guidelines.
+Do not invent guidelines or facts.
+Reply with JSON: {"issues": [{"pet": "<pet name>", "guideline": <guideline number>, "issue": "<what is wrong>", "suggestion": "<one concrete fix>"}]}
 Use {"issues": []} if the tasks follow every guideline."""
 
 
 def check_guidelines(llm: LLM, owner: Owner, retriever: Retriever, day: date) -> list[GuidelineIssue]:
-    """Ask the model which guidelines each pet's tasks break. Issues citing a guideline that doesn't exist are dropped."""
-    issues = []
-    for pet in owner.pets:
-        if not pet.guidelines:
-            continue
+    """Check every pet's tasks against its guidelines in one request. Issues citing a guideline that doesn't exist are dropped."""
+    pets = {pet.name.lower(): pet for pet in owner.pets if pet.guidelines}
+    if not pets:
+        return []
+    sections = [f"Today: {day:%A %b %d %Y}"]
+    for pet in pets.values():
         guidelines = "\n".join(f"{i}. {g}" for i, g in enumerate(pet.guidelines, 1))
         tasks = "\n".join(f"- {describe_task(t, day)}" for t in pet.tasks if not t.is_completed(day)) or "- (no tasks)"
         history = retriever.search(" ".join(pet.guidelines), pet_name=pet.name, source="history", k=6)
-        prompt = (
-            f"Pet: {pet.name} ({pet.species}, {pet.age} years). Notes: {pet.notes or 'none'}\n"
-            f"Today: {day:%A %b %d %Y}\n\nGuidelines:\n{guidelines}\n\n"
-            f"Current tasks:\n{tasks}\n\nRecent history:\n{format_hits(history)}"
+        sections.append(
+            f"## {pet.name} ({pet.species}, {pet.age} years). Notes: {pet.notes or 'none'}\n"
+            f"Guidelines:\n{guidelines}\nCurrent tasks:\n{tasks}\nRecent history:\n{format_hits(history)}"
         )
-        reply = llm.generate_json(CHECK_SYSTEM, prompt)
-        for item in reply.get("issues", []) if isinstance(reply, dict) else []:
-            number, issue = item.get("guideline"), str(item.get("issue") or "").strip()
-            if not isinstance(number, int) or not 1 <= number <= len(pet.guidelines) or not issue:
-                continue  # can't be traced to a real guideline, so don't show it
-            issues.append(GuidelineIssue(
-                pet.name, pet.guidelines[number - 1], issue,
-                str(item.get("suggestion") or "").strip(), f"{pet.name} guideline {number}",
-            ))
+    reply = llm.generate_json(CHECK_SYSTEM, "\n\n".join(sections))
+    issues = []
+    for item in reply.get("issues", []) if isinstance(reply, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        pet = pets.get(str(item.get("pet") or "").strip().lower())
+        number, issue = item.get("guideline"), str(item.get("issue") or "").strip()
+        if pet is None or not isinstance(number, int) or not 1 <= number <= len(pet.guidelines) or not issue:
+            continue  # can't be traced to a real pet's guideline, so don't show it
+        issues.append(GuidelineIssue(
+            pet.name, pet.guidelines[number - 1], issue,
+            str(item.get("suggestion") or "").strip(), f"{pet.name} guideline {number}",
+        ))
     return issues

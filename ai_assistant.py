@@ -224,8 +224,9 @@ def plan_warnings(schedule: Schedule, changes: list[dict]) -> list[str]:
 
 @dataclass
 class AgentStep:
-    """One tool call the agent made and what it got back."""
+    """One action the agent took and what it got back."""
 
+    turn: int  # which model call it came from
     thought: str
     tool: str
     args: dict
@@ -243,75 +244,106 @@ class PlanProposal:
     summary: str = ""
     steps: list[AgentStep] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    turns: int = 0  # model calls used
 
 
 AGENT_SYSTEM = """You are PawPal+'s planning agent. You prepare a proposed plan for one day; the owner reviews it,
 and nothing you do is final until they approve it.
-Work step by step. Each turn, reply with ONE JSON object: {"thought": "<short reasoning>", "tool": "<name>", "args": {...}}
+Each prompt shows the owner's guidelines, relevant history, the tasks due, and the current schedule, refreshed after every change.
+Reply with ONE JSON object: {"thought": "<short reasoning>", "actions": [{"tool": "<name>", "args": {...}}, ...]}
+You may send several actions in one reply; they run in order.
 Tools:
-- list_tasks {"pet_name": optional}: tasks due on the plan day
-- generate_schedule {}: run the scheduler and see what is planned, skipped, and why
-- search_guidelines {"query": "...", "pet_name": optional}: the owner's care guidelines and recent task history
 - set_available_time {"day_start": "HH:MM", "available_minutes": number}
 - update_task {"pet_name", "title", and any of "priority" ("low"/"medium"/"high"), "preferred_time" ("HH:MM" or "flexible"), "duration_minutes"}
 - add_task {"pet_name", "title", "duration_minutes", "priority", "preferred_time", "frequency" ("daily"/"weekly")}
 - defer_task {"pet_name", "title"}: move a due task to the next day
+- search_guidelines {"query": "...", "pet_name": optional}: search older task history
 - finish {"summary": "<what you changed and why, written to the owner>"}
 Rules:
-- The scheduler decides the times; you only change settings. Run generate_schedule after making changes and before finishing.
-- Check search_guidelines before lowering a priority or deferring a task, and follow the owner's guidelines.
-- Make the fewest changes that meet the goal. If the goal is already met, finish without changes."""
+- The scheduler decides the times; you only change settings.
+- finish only takes effect in a reply with no changes, so you see the schedule your changes produce before finishing.
+- Follow the owner's guidelines and cite them like [Mochi guideline 1] in the summary.
+- Make the fewest changes that meet the goal. If the goal is already met, reply with only finish."""
 
 CHANGE_TOOLS = {"set_available_time", "add_task", "update_task", "defer_task"}
+MAX_ACTIONS_PER_TURN = 8
 
 
 class PlanningAgent:
-    """Plans a day by calling PawPal+'s own methods as tools, on a copy of the owner's data."""
+    """Plans a day by calling PawPal+'s own methods as tools, on a copy of the owner's data.
 
-    def __init__(self, llm: LLM, owner: Owner, day: date, retriever: Retriever, max_steps: int = 10):
-        self.llm, self.owner, self.day, self.retriever, self.max_steps = llm, owner, day, retriever, max_steps
+    To stay within free-tier rate limits, every prompt already contains the due tasks, the current schedule,
+    the guidelines, and relevant history, and one reply can carry several actions. A typical plan takes two
+    model calls: one to make changes and one to finish after seeing the result.
+    """
+
+    def __init__(self, llm: LLM, owner: Owner, day: date, retriever: Retriever, max_turns: int = 4):
+        self.llm, self.owner, self.day, self.retriever, self.max_turns = llm, owner, day, retriever, max_turns
 
     def run(self, goal: str) -> PlanProposal:
-        """Run the plan → act → observe loop until the model calls finish or max_steps is reached."""
+        """Run the plan → act → observe loop until the model finishes or max_turns is reached."""
         work = copy.deepcopy(self.owner)
+        history = format_hits(self.retriever.search(
+            " ".join([goal, *(t.title for t in work.all_tasks())]), source="history", k=5
+        ))
         steps, changes, summary, warnings = [], [], "", []
-        for _ in range(self.max_steps):
-            action = self.llm.generate_json(AGENT_SYSTEM, self._prompt(work, goal, steps))
-            if not isinstance(action, dict):
-                action = {}
-            tool, args = str(action.get("tool") or ""), action.get("args") or {}
-            if tool == "finish":
-                summary = str(args.get("summary") or "").strip() if isinstance(args, dict) else ""
+        for turn in range(1, self.max_turns + 1):
+            reply = self.llm.generate_json(AGENT_SYSTEM, self._prompt(work, goal, history, steps))
+            reply = reply if isinstance(reply, dict) else {}
+            thought = str(reply.get("thought") or "")
+            actions = reply.get("actions") if isinstance(reply.get("actions"), list) else [reply] if "tool" in reply else []
+            if not actions:
+                steps.append(AgentStep(turn, thought, "", {}, "error: reply had no actions"))
+                continue
+            changed, finish = False, None
+            for action in actions[:MAX_ACTIONS_PER_TURN]:
+                action = action if isinstance(action, dict) else {}
+                tool, args = str(action.get("tool") or ""), action.get("args") or {}
+                if not isinstance(args, dict):
+                    steps.append(AgentStep(turn, thought, tool, {}, "error: args must be an object"))
+                elif tool == "finish":
+                    finish = args
+                else:
+                    before = len(changes)
+                    steps.append(AgentStep(turn, thought, tool, args, self._call_tool(work, tool, args, changes)))
+                    changed = changed or len(changes) > before
+            if finish is not None and changed:
+                steps.append(AgentStep(turn, thought, "finish", finish, "not yet: review the schedule your changes produced, then finish"))
+            elif finish is not None:
+                summary = str(finish.get("summary") or "").strip()
                 break
-            result = self._call_tool(work, tool, args, changes) if isinstance(args, dict) else "error: args must be an object"
-            steps.append(AgentStep(str(action.get("thought") or ""), tool, args, result))
         else:
-            warnings.append(f"The agent stopped after {self.max_steps} steps without finishing. Review its changes carefully.")
+            warnings.append(f"The agent stopped after {self.max_turns} turns without finishing. Review its changes carefully.")
         schedule = work.create_schedule(self.day)
-        return PlanProposal(goal, self.day, changes, schedule, summary, steps, warnings + plan_warnings(schedule, changes))
+        return PlanProposal(
+            goal, self.day, changes, schedule, summary, steps,
+            warnings + plan_warnings(schedule, changes), turns=turn,
+        )
 
-    def _prompt(self, work: Owner, goal: str, steps: list[AgentStep]) -> str:
-        """The day's context, the owner's goal, and every step so far."""
+    def _prompt(self, work: Owner, goal: str, history: str, steps: list[AgentStep]) -> str:
+        """Everything the agent needs for its next reply, so it never spends a call just to look things up."""
+        guidelines = "\n".join(
+            f"- [{p.name} guideline {i}] {g}" for p in work.pets for i, g in enumerate(p.guidelines, 1)
+        ) or "- (none)"
+        due = "\n".join(f"- {describe_task(t, self.day)}" for p in work.pets for t in p.due_tasks(self.day)) or "- (none)"
         lines = [
             f"Plan day: {self.day:%A %b %d %Y}",
-            f"Owner: {work.name}, available {fmt(work.day_start)}-{fmt(work.day_end)} ({work.available_minutes} min)",
             f"Pets: {', '.join(f'{p.name} ({p.species}, {p.age})' for p in work.pets)}",
-            f"\nGoal from the owner:\n{goal}\n",
+            f"\nGoal from the owner:\n{goal}",
+            f"\nOwner's guidelines:\n{guidelines}",
+            f"\nRelevant history:\n{history}",
+            f"\nTasks due:\n{due}",
+            f"\nCurrent schedule:\n{work.create_schedule(self.day).explain()}",
         ]
-        for i, step in enumerate(steps, 1):
-            lines.append(f"Step {i}: {step.tool} {json.dumps(step.args)}\nResult:\n{step.result}\n")
-        lines.append("What is your next action?")
+        if steps:
+            lines.append("\nYour previous actions:")
+            lines += [f"Turn {s.turn}: {s.tool} {json.dumps(s.args)} -> {s.result}" for s in steps]
+        lines.append("\nReply with your next actions.")
         return "\n".join(lines)
 
     def _call_tool(self, work: Owner, tool: str, args: dict, changes: list[dict]) -> str:
         """Run one tool against the working copy. Errors are returned as text so the agent can correct itself."""
         try:
-            if tool == "list_tasks":
-                pet_name = str(args.get("pet_name") or "").lower()
-                tasks = [t for p in work.pets if not pet_name or p.name.lower() == pet_name for t in p.due_tasks(self.day)]
-                return "\n".join(describe_task(t, self.day) for t in tasks) or "No tasks are due."
-            if tool == "generate_schedule":
-                return work.create_schedule(self.day).explain()
             if tool == "search_guidelines":
                 return format_hits(self.retriever.search(str(args.get("query") or ""), pet_name=args.get("pet_name") or None, k=5))
             if tool in CHANGE_TOOLS:
