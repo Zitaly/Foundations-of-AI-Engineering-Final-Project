@@ -12,9 +12,10 @@ from ai_assistant import (
     draft_from_json,
     explain_schedule,
     parse_task,
+    parse_time,
     suggest_tasks,
 )
-from llm import GeminiLLM, LLMError, parse_json
+from llm import MAX_WAIT_SECONDS, APIError, FallbackLLM, GeminiLLM, GroqLLM, LLMError, parse_json
 from pawpal_system import Owner, Pet, Priority, Task
 from rag import Retriever, build_documents, check_guidelines
 
@@ -96,13 +97,22 @@ def test_draft_rejects_unknown_pet():
     {"duration_minutes": "lots"},
     {"priority": "urgent"},
     {"frequency": "monthly"},
-    {"preferred_time": "6pm"},
+    {"preferred_time": "25:00"},
+    {"preferred_time": "around six"},
     {"title": ""},
 ])
 def test_draft_rejects_invalid_fields(bad):
     data = {"pet_name": "Mochi", "title": "Walk", "duration_minutes": 10, **bad}
     with pytest.raises(ValueError):
         draft_from_json(data, make_owner())
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("18:30", time(18, 30)), ("6pm", time(18, 0)), ("6:30 p.m.", time(18, 30)),
+    ("7 AM", time(7, 0)), ("noon", time(12, 0)), ("flexible", None), (None, None),
+])
+def test_parse_time_accepts_common_formats(text, expected):
+    assert parse_time(text) == expected
 
 
 def test_draft_defaults_to_only_pet():
@@ -334,6 +344,35 @@ def test_agent_flags_deferred_and_skipped_high_priority_tasks():
     assert owner.available_minutes == 120
 
 
+class FailAfter(FakeLLM):
+    """Answers with the scripted replies, then raises LLMError like a model that hit its quota."""
+
+    def _next(self, system, prompt):
+        if not self.replies:
+            raise LLMError("quota exceeded")
+        return super()._next(system, prompt)
+
+    generate_json = _next
+
+
+def test_agent_keeps_partial_plan_when_model_fails_mid_run():
+    owner = make_owner()
+    llm = FailAfter(act(("update_task", {"pet_name": "Mochi", "title": "Fetch", "priority": "high"})))
+
+    proposal = PlanningAgent(llm, owner, DAY, retriever_for(owner)).run("goal")
+
+    assert len(proposal.changes) == 1
+    assert proposal.turns == 1
+    assert any("stopped responding after 1 turn" in w for w in proposal.warnings)
+    assert not any("without finishing" in w for w in proposal.warnings)
+
+
+def test_agent_failure_on_first_turn_is_raised_for_fallback():
+    owner = make_owner()
+    with pytest.raises(LLMError):
+        PlanningAgent(FailAfter(), owner, DAY, retriever_for(owner)).run("goal")
+
+
 def test_apply_changes_is_all_or_nothing():
     owner = make_owner()
     changes = [
@@ -387,9 +426,9 @@ class FakeModels:
 def make_gemini(outcomes, rpm=15) -> GeminiLLM:
     llm = GeminiLLM.__new__(GeminiLLM)  # skip __init__, which needs a real key
     llm.model, llm.models = "primary", ["primary", "backup"]
-    llm.temperature, llm.rpm = 0.2, rpm
+    llm.temperature, llm.rpm, llm.max_wait = 0.2, rpm, MAX_WAIT_SECONDS
     llm.request_count = llm.cache_hits = 0
-    llm._cache, llm._busy_until = OrderedDict(), {}
+    llm._cache, llm._busy_until, llm._cache_path = OrderedDict(), {}, None
     llm._sent = {m: deque() for m in llm.models}
     llm._client = SimpleNamespace(models=FakeModels(outcomes))
     return llm
@@ -418,3 +457,140 @@ def test_gemini_raises_other_errors_without_fallback():
     llm = make_gemini({"primary": [FakeAPIError(400, "bad request")], "backup": ["unused"]})
     with pytest.raises(LLMError, match="bad request"):
         llm.generate_text("sys", "prompt")
+
+
+def test_gemini_skips_a_retired_model_for_the_rest_of_the_session():
+    llm = make_gemini({"primary": [FakeAPIError(404, "model not found")], "backup": ["one", "two"]})
+    assert llm.generate_text("sys", "first") == "one"
+    assert llm.generate_text("sys", "second") == "two"
+    assert llm._client.models.calls == ["primary", "backup", "backup"]
+
+
+class ReadTimeout(Exception):
+    """Named like httpx's timeout, which has no status code."""
+
+
+def test_gemini_falls_back_on_timeout():
+    llm = make_gemini({"primary": [ReadTimeout("timed out")], "backup": ["ok"]})
+    assert llm.generate_text("sys", "prompt") == "ok"
+
+
+def test_gemini_tries_next_model_after_empty_reply():
+    llm = make_gemini({"primary": [""], "backup": ["ok"]})
+    assert llm.generate_text("sys", "prompt") == "ok"
+
+
+def test_gemini_reports_every_model_blocked():
+    llm = make_gemini({"primary": [""], "backup": [""]})
+    with pytest.raises(LLMError, match="empty or unusable response"):
+        llm.generate_text("sys", "prompt")
+
+
+def test_gemini_asks_again_after_invalid_json_and_does_not_cache_it():
+    llm = make_gemini({"primary": ["not json", '{"a": 1}', '{"a": 2}']})
+    assert llm.generate_json("sys", "prompt") == {"a": 1}
+    assert llm.request_count == 2
+    assert ("application/json", "sys", "prompt") not in llm._cache  # the broken reply isn't served again
+    assert llm.generate_json("sys", "prompt") == {"a": 2}
+
+
+# ---- Groq client and provider chain (no network) ----
+
+class ScriptedGroq(GroqLLM):
+    """GroqLLM whose HTTP call returns scripted replies (dicts) or raises scripted errors, recording each body."""
+
+    def __init__(self, *outcomes, cache_dir=None):
+        super().__init__(api_key="test-key", cache_dir=cache_dir)
+        self.outcomes, self.bodies = list(outcomes), []
+
+    def _post(self, body):
+        self.bodies.append(body)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def reply(text):
+    return {"choices": [{"message": {"content": text}}]}
+
+
+def test_groq_sends_json_mode_and_low_reasoning_effort():
+    groq = ScriptedGroq(reply('{"a": 1}'))
+
+    assert groq.generate_json("Reply with JSON.", "prompt") == {"a": 1}
+
+    body = groq.bodies[0]
+    assert body["model"] == "openai/gpt-oss-20b"
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["reasoning_effort"] == "low"
+    assert body["messages"][0] == {"role": "system", "content": "Reply with JSON."}
+
+
+def test_groq_moves_to_next_model_on_rate_limit_using_retry_after():
+    groq = ScriptedGroq(APIError(429, "rate limited", {"retry-after": "7"}), reply("hi"))
+
+    assert groq.generate_text("sys", "prompt") == "hi"
+    assert [b["model"] for b in groq.bodies] == ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+    assert "reasoning_effort" in groq.bodies[1] and "response_format" not in groq.bodies[1]
+
+
+def test_groq_treats_failed_json_validation_as_unusable_and_tries_next_model():
+    groq = ScriptedGroq(APIError(400, '{"error": {"code": "json_validate_failed"}}'), reply('{"ok": true}'))
+    assert groq.generate_json("sys", "prompt") == {"ok": True}
+
+
+def test_groq_strips_leaked_reasoning():
+    assert ScriptedGroq(reply("<think>hmm</think>Hello")).generate_text("sys", "p") == "Hello"
+
+
+def test_groq_needs_a_key(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with pytest.raises(LLMError, match="No Groq API key"):
+        GroqLLM(cache_dir=None)
+
+
+def test_fallback_llm_uses_next_provider_and_records_who_answered():
+    gemini = make_gemini({"primary": [FakeAPIError(400, "bad request")], "backup": []})
+    groq = ScriptedGroq(reply("from groq"))
+    chain = FallbackLLM([gemini, groq])
+
+    assert chain.generate_text("sys", "prompt") == "from groq"
+    assert chain.last_used == "Groq (openai/gpt-oss-20b)"
+    assert chain.name == "Gemini → Groq"
+
+
+def test_fallback_llm_raises_when_every_provider_fails():
+    chain = FallbackLLM([ScriptedGroq(APIError(401, "invalid key"))])
+    with pytest.raises(LLMError, match="invalid key"):
+        chain.generate_text("sys", "prompt")
+
+
+def test_reply_cache_survives_a_restart(tmp_path):
+    first = ScriptedGroq(reply("cached answer"), cache_dir=tmp_path)
+    assert first.generate_text("sys", "prompt") == "cached answer"
+
+    second = ScriptedGroq(cache_dir=tmp_path)  # no scripted replies: any request would fail
+    assert second.generate_text("sys", "prompt") == "cached answer"
+    assert second.cache_hits == 1 and second.request_count == 0
+
+
+def test_damaged_cache_file_is_ignored(tmp_path):
+    (tmp_path / "groq.json").write_text("not json")
+    assert ScriptedGroq(reply("fresh"), cache_dir=tmp_path).generate_text("sys", "p") == "fresh"
+
+
+# ---- Agent tools for timing rules ----
+
+def test_agent_can_set_window_and_order():
+    owner = make_owner()
+    changes = [
+        {"tool": "update_task", "args": {"pet_name": "Mochi", "title": "Fetch", "not_before": "09:00", "done_by": "10:00"}},
+        {"tool": "update_task", "args": {"pet_name": "Mochi", "title": "Fetch", "after": "Morning walk", "after_gap_minutes": 10}},
+    ]
+
+    descriptions = apply_changes(owner, changes, DAY)
+
+    fetch = owner.pets[0].tasks[1]
+    assert (fetch.not_before, fetch.done_by, fetch.after, fetch.after_gap_minutes) == (time(9, 0), time(10, 0), "Morning walk", 10)
+    assert "not_before → 09:00" in descriptions[0]

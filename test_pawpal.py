@@ -292,9 +292,46 @@ def test_shortest_first_preference_ignores_priority_order():
     assert starts(schedule) == {"Feed": "08:00", "Brush": "08:10", "Walk": "08:20"}
 
 
-def test_low_priority_fixed_task_can_crowd_out_high_priority_flexible_task():
-    # Current design: fixed tasks are placed before flexible ones regardless of priority.
+def test_high_priority_flexible_task_bumps_low_priority_fixed_task():
     owner, pet = make_owner(available_minutes=30)
+    toy = Task("Toy", 20, "low", preferred_time=time(8, 5), start_date=DAY)
+    meds = Task("Meds", 15, "high", start_date=DAY)
+    pet.add_task(toy)
+    pet.add_task(meds)
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule) == {"Meds": "08:00"}
+    assert schedule.reasons[meds] == "high priority, made room by bumping Mochi: Toy"
+    assert schedule.reasons[toy] == "bumped by higher-priority Mochi: Meds"
+    assert schedule.conflict_messages() == ["Mochi: Toy at 08:05 overlaps Mochi: Meds - skipped"]
+
+
+def test_bumped_task_is_moved_instead_of_skipped_when_it_still_fits():
+    owner, pet = make_owner(available_minutes=60)
+    pet.add_task(Task("Toy", 20, "low", preferred_time=time(8, 20), start_date=DAY))
+    pet.add_task(Task("Walk", 40, "high", start_date=DAY))  # needs 08:00-08:40, which Toy blocks
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule) == {"Walk": "08:00", "Toy": "08:40"}
+    assert not schedule.has_conflicts()
+
+
+def test_bumping_never_displaces_equal_priority_tasks():
+    owner, pet = make_owner(available_minutes=30)
+    pet.add_task(Task("Toy", 20, "high", preferred_time=time(8, 5), start_date=DAY))
+    meds = Task("Meds", 15, "high", start_date=DAY)
+    pet.add_task(meds)
+
+    schedule = owner.create_schedule(DAY)
+
+    assert list(starts(schedule)) == ["Toy"]
+    assert schedule.reasons[meds] == "needs 15 min, largest free slot is 5 min"
+
+
+def test_bumping_can_be_turned_off():
+    owner, pet = make_owner(available_minutes=30, bump_lower_priority=False)
     pet.add_task(Task("Toy", 20, "low", preferred_time=time(8, 5), start_date=DAY))
     meds = Task("Meds", 15, "high", start_date=DAY)
     pet.add_task(meds)
@@ -303,6 +340,80 @@ def test_low_priority_fixed_task_can_crowd_out_high_priority_flexible_task():
 
     assert list(starts(schedule)) == ["Toy"]
     assert schedule.reasons[meds] == "needs 15 min, largest free slot is 5 min"
+
+
+def test_critical_task_outranks_high_and_bumps_it():
+    owner, pet = make_owner(available_minutes=20)
+    pet.add_task(Task("Walk", 20, "high", preferred_time=time(8, 0), start_date=DAY))
+    meds = Task("Meds", 5, "critical", start_date=DAY)
+    pet.add_task(meds)
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule)["Meds"] == "08:00"
+    assert "Walk" not in starts(schedule)
+
+
+# Weighted priority: overdue tasks gain priority each day
+
+
+def test_overdue_low_task_rises_above_medium_after_enough_days():
+    owner, pet = make_owner(available_minutes=20)
+    friday = DAY + timedelta(days=4)
+    brush = Task("Brush", 20, "low", start_date=DAY)  # 4 days overdue: 1 + 4 * 0.5 = 3 (high)
+    pet.add_task(brush)
+    pet.add_task(Task("Play", 20, "medium", start_date=friday))
+
+    schedule = owner.create_schedule(friday)
+
+    assert list(starts(schedule)) == ["Brush"]
+    assert schedule.reasons[brush].startswith("low priority, raised to high after 4 days overdue")
+
+
+def test_overdue_boost_is_capped_below_critical():
+    owner, _ = make_owner()
+    old = Task("Brush", 20, "low", start_date=DAY - timedelta(days=30))
+    schedule = owner.create_schedule(DAY)
+
+    assert schedule.effective_priority(old) == Priority.HIGH
+    assert schedule.effective_priority(Task("Meds", 5, "critical", start_date=DAY)) == Priority.CRITICAL
+
+
+def test_overdue_boost_can_be_turned_off():
+    owner, pet = make_owner(available_minutes=20, overdue_boost_per_day=0)
+    friday = DAY + timedelta(days=4)
+    pet.add_task(Task("Brush", 20, "low", start_date=DAY))
+    pet.add_task(Task("Play", 20, "medium", start_date=friday))
+
+    assert list(starts(owner.create_schedule(friday))) == ["Play"]
+
+
+# Next available slot
+
+
+def test_next_available_slot_finds_first_gap_that_fits():
+    owner, pet = make_owner()
+    pet.add_task(Task("Feed", 10, "high", preferred_time=time(8, 0), start_date=DAY))
+    pet.add_task(Task("Walk", 30, "high", preferred_time=time(8, 15), start_date=DAY))
+    schedule = owner.create_schedule(DAY)
+
+    assert schedule.next_available_slot(5) == time(8, 10)
+    assert schedule.next_available_slot(20) == time(8, 45)
+    assert schedule.next_available_slot(20, after=time(9, 0)) == time(9, 0)
+    assert schedule.next_available_slot(200) is None
+
+
+# Task ids
+
+
+def test_each_occurrence_gets_its_own_id():
+    _, pet = make_owner()
+    walk = Task("Walk", 20, start_date=DAY)
+    pet.add_task(walk)
+
+    next_walk = pet.complete_task(walk, DAY)
+
+    assert walk.id and next_walk.id and walk.id != next_walk.id
 
 
 # Recurrence
@@ -500,7 +611,7 @@ def test_explain_with_no_due_tasks():
     [
         ({"duration_minutes": 0}, "duration_minutes must be positive"),
         ({"frequency": "Daily"}, "frequency must be one of"),
-        ({"priority": "urgent"}, "priority must be low, medium, or high"),
+        ({"priority": "urgent"}, "priority must be one of low, medium, high, critical"),
     ],
 )
 def test_invalid_task_is_rejected(kwargs, message):
@@ -585,7 +696,7 @@ def test_integer_priority_is_converted():
 
 
 def test_out_of_range_integer_priority_is_rejected():
-    with pytest.raises(ValueError, match="priority must be low, medium, or high"):
+    with pytest.raises(ValueError, match="priority must be one of"):
         Task("Walk", 20, 5)
 
 
@@ -617,3 +728,171 @@ def test_set_window_rejects_invalid_pair_without_changing_anything():
         owner.set_window(time(23, 0), 120)
 
     assert (owner.day_start, owner.available_minutes) == (time(8, 0), 120)
+
+
+# Time windows
+
+
+def test_flexible_task_waits_for_its_not_before_time():
+    owner, pet = make_owner()
+    walk = Task("Walk", 30, not_before=time(9, 0), start_date=DAY)
+    pet.add_task(walk)
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule) == {"Walk": "09:00"}
+    assert schedule.reasons[walk].endswith("within its window (not before 09:00)")
+
+
+def test_done_by_task_is_placed_before_its_deadline_even_when_low_priority():
+    owner, pet = make_owner()
+    pet.add_task(Task("Play", 60, "high", start_date=DAY))
+    pet.add_task(Task("Meds", 10, "low", done_by=time(8, 30), start_date=DAY))
+
+    schedule = owner.create_schedule(DAY)
+
+    # Play takes 08:00-09:00 first; Meds can't fit before 08:30 and Play outranks it, so it's skipped with a clear reason.
+    assert "Meds" not in starts(schedule)
+    assert "within 08:00-08:30" in schedule.reasons[schedule.skipped[0]]
+
+
+def test_done_by_task_bumps_lower_priority_task_out_of_its_window():
+    owner, pet = make_owner()
+    pet.add_task(Task("Play", 60, "low", start_date=DAY))
+    pet.add_task(Task("Meds", 10, "high", done_by=time(8, 30), start_date=DAY))
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule)["Meds"] == "08:00"
+    assert starts(schedule)["Play"] == "08:10"
+
+
+@pytest.mark.parametrize("kwargs, message", [
+    ({"not_before": time(9, 0), "done_by": time(9, 10)}, "shorter than the task"),
+    ({"preferred_time": time(8, 0), "not_before": time(9, 0)}, "before its not-before time"),
+    ({"preferred_time": time(8, 50), "done_by": time(9, 0)}, "ends after its done-by time"),
+    ({"after": "walk"}, "can't come after itself"),
+    ({"after": "Feed", "after_gap_minutes": -5}, "can't be negative"),
+])
+def test_invalid_timing_rules_are_rejected(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        Task("Walk", 20, **kwargs)
+
+
+# Ordering rules
+
+
+def test_task_is_placed_after_its_predecessor_with_gap():
+    owner, pet = make_owner()
+    pet.add_task(Task("Meds", 5, "high", after="Breakfast", after_gap_minutes=15, start_date=DAY))
+    pet.add_task(Task("Breakfast", 10, "low", start_date=DAY))
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule) == {"Breakfast": "08:00", "Meds": "08:25"}
+    meds = next(t for _, t in schedule.planned if t.title == "Meds")
+    assert "after Mochi: Breakfast +15 min" in schedule.reasons[meds]
+
+
+def test_fixed_task_that_breaks_its_order_is_moved():
+    owner, pet = make_owner()
+    pet.add_task(Task("Breakfast", 10, "high", preferred_time=time(9, 0), start_date=DAY))
+    meds = Task("Meds", 5, "high", preferred_time=time(8, 30), after="Breakfast", start_date=DAY)
+    pet.add_task(meds)
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule) == {"Breakfast": "09:00", "Meds": "09:10"}
+    assert "to avoid the order with Mochi: Breakfast" in schedule.reasons[meds]
+    assert meds not in schedule.conflicts  # not an overlap, so not reported as a time conflict
+
+
+def test_predecessor_must_finish_before_a_fixed_dependent():
+    owner, pet = make_owner()
+    pet.add_task(Task("Walk", 30, "high", preferred_time=time(8, 30), after="Harness on", start_date=DAY))
+    pet.add_task(Task("Harness on", 5, "low", start_date=DAY))
+    pet.add_task(Task("Brush", 30, "medium", start_date=DAY))
+
+    schedule = owner.create_schedule(DAY)
+
+    assert starts(schedule)["Harness on"] < "08:30"
+    assert starts(schedule)["Walk"] == "08:30"
+
+
+def test_ordering_rule_only_applies_within_the_same_pet():
+    owner, mochi = make_owner()
+    biscuit = Pet("Biscuit", "cat")
+    owner.add_pet(biscuit)
+    biscuit.add_task(Task("Breakfast", 10, "high", preferred_time=time(9, 0), start_date=DAY))
+    mochi.add_task(Task("Meds", 5, "high", after="Breakfast", start_date=DAY))
+
+    assert starts(owner.create_schedule(DAY))["Meds"] == "08:00"
+
+
+def test_rule_with_missing_predecessor_is_ignored():
+    owner, pet = make_owner()
+    pet.add_task(Task("Meds", 5, after="Breakfast", start_date=DAY))
+    assert starts(owner.create_schedule(DAY)) == {"Meds": "08:00"}
+
+
+# Best-fit packing
+
+
+def make_fragmented_owner(**kwargs) -> tuple[Owner, Pet]:
+    """Free gaps of 25 and 30 minutes around fixed tasks; flexible tasks of 20, 25, and 10 minutes."""
+    owner, pet = make_owner(available_minutes=60, **kwargs)
+    pet.add_task(Task("Feed", 5, "critical", preferred_time=time(8, 25), start_date=DAY))
+    pet.add_task(Task("Short walk", 20, "high", start_date=DAY))
+    pet.add_task(Task("Long walk", 25, "high", start_date=DAY))
+    pet.add_task(Task("Brush", 10, "medium", start_date=DAY))
+    return owner, pet
+
+
+def test_first_fit_wastes_space_and_skips_a_task():
+    owner, _ = make_fragmented_owner(best_fit_packing=False)
+    schedule = owner.create_schedule(DAY)
+    assert [t.title for t in schedule.skipped] == ["Brush"]
+
+
+def test_best_fit_packing_fits_every_task():
+    owner, _ = make_fragmented_owner()
+
+    schedule = owner.create_schedule(DAY)
+
+    assert schedule.skipped == []
+    assert starts(schedule) == {"Long walk": "08:00", "Feed": "08:25", "Short walk": "08:30", "Brush": "08:50"}
+    long_walk = next(t for _, t in schedule.planned if t.title == "Long walk")
+    assert "so more important tasks fit" in schedule.reasons[long_walk]
+    assert not schedule.has_conflicts()
+
+
+def test_best_fit_never_trades_a_higher_priority_task_for_lower_ones():
+    owner, pet = make_owner(available_minutes=30)
+    pet.add_task(Task("Walk", 30, "high", start_date=DAY))
+    pet.add_task(Task("Brush", 15, "low", start_date=DAY))
+    pet.add_task(Task("Play", 15, "low", start_date=DAY))
+
+    assert list(starts(owner.create_schedule(DAY))) == ["Walk"]
+
+
+def test_best_fit_in_shortest_first_mode_fits_the_most_tasks():
+    owner, pet = make_owner(available_minutes=30, prefer_high_priority_first=False)
+    pet.add_task(Task("Walk", 30, "high", start_date=DAY))
+    pet.add_task(Task("Brush", 15, "low", start_date=DAY))
+    pet.add_task(Task("Play", 15, "low", start_date=DAY))
+
+    assert set(starts(owner.create_schedule(DAY))) == {"Brush", "Play"}
+
+
+# Editing tasks
+
+
+def test_update_validates_before_changing_anything():
+    walk = Task("Walk", 30, "low")
+
+    with pytest.raises(ValueError):
+        walk.update(priority="high", duration_minutes=0)
+    assert (walk.priority, walk.duration_minutes) == (Priority.LOW, 30)
+
+    walk.update(priority="high", not_before=time(9, 0))
+    assert (walk.priority, walk.not_before) == (Priority.HIGH, time(9, 0))

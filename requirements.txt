@@ -1,4 +1,5 @@
-streamlit>=1.36
+streamlit>=1.66
 pytest>=7.0
 pandas
 google-genai>=1.0
+rich>=13

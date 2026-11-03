@@ -1,4 +1,4 @@
-%% PawPal+ planned AI system: components, data flow, and human/testing checkpoints.
+%% PawPal+ AI system: components, data flow, fallbacks, storage, and human/testing checkpoints.
 %% Solid arrows = data flow. Dotted arrows = verification (human review or automated tests).
 flowchart TD
     User(["👤 Pet owner"])
@@ -17,7 +17,10 @@ flowchart TD
         Explainer["Schedule explainer<br/>rewrites explain() in plain language"]
     end
 
-    LLM[["LLM API"]]
+    subgraph Providers["LLM providers (llm.py, FallbackLLM)"]
+        LLM[["Gemini → Groq<br/>cached on disk, paced, model fallback"]]
+    end
+    Rules["Built-in rules (offline.py)<br/>used when every provider fails<br/>or no key is set"]
 
     subgraph RAG["RAG (rag.py)"]
         GuideStore[("Pet guidelines<br/>user-created, one set per pet")]
@@ -28,14 +31,16 @@ flowchart TD
 
     subgraph Agent["Planning agent (ai_assistant.py)"]
         Loop["Agent loop<br/>plan → call tool → observe → revise"]
-        Tools["Tools wrapping existing methods<br/>list_tasks · add_task · remove_task<br/>generate_schedule · search_guidelines"]
+        Tools["Tools wrapping existing methods<br/>set_available_time · add_task · update_task<br/>defer_task · search_guidelines · finish"]
     end
 
     subgraph Core["Core system (pawpal_system.py)"]
         Validate{"Task.__post_init__<br/>validation"}
         Model["Owner / Pet / Task"]
-        Scheduler["Schedule.generate()<br/>deterministic placement + reasons"]
+        Scheduler["Schedule.generate()<br/>priority + overdue aging · time windows<br/>ordering rules · best-fit packing · bumping"]
     end
+
+    Storage[("JSON storage (storage.py)<br/>data/pawpal.json, autosaved")]
 
     subgraph Review["🧑 Human review checkpoints"]
         ReviewTask{"Confirm or edit<br/>parsed task"}
@@ -49,6 +54,7 @@ flowchart TD
         MockTests["AI tests with mocked LLM<br/>parser output, tool calls, agent stop conditions"]
         RetrievalEval["Retrieval eval<br/>query → expected guideline chunk"]
         SafetyCheck["Plan checks<br/>has_conflicts() is False, required tasks planned"]
+        FallbackTests["Fallback tests<br/>rule-based features, provider chain, storage round trip"]
     end
 
     %% Typing a task
@@ -98,6 +104,14 @@ flowchart TD
     ReviewPlan -- "approved" --> Validate
     ReviewPlan -- "rejected, with feedback" --> Loop
 
+    %% Fallbacks and persistence
+    Parser -. "AI unavailable" .-> Rules
+    Ideas -. "AI unavailable" .-> Rules
+    Explainer -. "AI unavailable" .-> Rules
+    Checker -. "AI unavailable" .-> Rules
+    Loop -. "AI unavailable" .-> Rules
+    Model <--> Storage
+
     %% Verification
     UnitTests -.-> Scheduler
     UnitTests -.-> Validate
@@ -106,12 +120,14 @@ flowchart TD
     MockTests -.-> Loop
     RetrievalEval -.-> Retriever
     SafetyCheck -.-> Loop
+    FallbackTests -.-> Rules
+    FallbackTests -.-> Storage
 
     classDef human fill:#fde68a,stroke:#b45309,color:#000
     classDef test fill:#bbf7d0,stroke:#15803d,color:#000
     classDef ai fill:#ddd6fe,stroke:#6d28d9,color:#000
     classDef data fill:#bae6fd,stroke:#0369a1,color:#000
     class User,ReviewTask,ReviewIdeas,ReviewPlan,ReviewWarn human
-    class UnitTests,MockTests,RetrievalEval,SafetyCheck test
-    class Parser,Ideas,Explainer,Loop,Tools,Checker,LLM ai
-    class GuideStore,HistoryStore data
+    class UnitTests,MockTests,RetrievalEval,SafetyCheck,FallbackTests test
+    class Parser,Ideas,Explainer,Loop,Tools,Checker,LLM,Rules ai
+    class GuideStore,HistoryStore,Storage data

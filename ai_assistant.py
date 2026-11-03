@@ -8,23 +8,48 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass, field, replace
+import re
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import Any, Callable, TypeVar
 
-from llm import LLM
+from llm import LLM, LLMError
 from pawpal_system import Owner, Priority, Schedule, Task, fmt
 from rag import Retriever, describe_task, format_hits
 
+T = TypeVar("T")
+
+TIME_FORMATS = ("%H:%M", "%I:%M %p", "%I %p")  # 18:30, 6:30 PM, 6 PM
+NAMED_TIMES = {"noon": time(12, 0), "midnight": time(0, 0)}
+
 
 def parse_time(value: Any) -> time | None:
-    """Parse "HH:MM" (or "H:MM") into a time; empty, null, or "flexible" means no fixed time."""
-    if value is None or str(value).strip().lower() in ("", "null", "none", "flexible"):
+    """Parse "18:30", "6:30pm", "6 pm", or "noon" into a time; empty, null, or "flexible" means no fixed time."""
+    text = "" if value is None else str(value).strip().lower()
+    if text in ("", "null", "none", "flexible"):
         return None
+    if text in NAMED_TIMES:
+        return NAMED_TIMES[text]
+    normalized = re.sub(r"\s*([ap])\.?m\.?$", r" \1m", text).upper()  # "6:30p.m." -> "6:30 PM"
+    for pattern in TIME_FORMATS:
+        try:
+            return datetime.strptime(normalized, pattern).time()
+        except ValueError:
+            pass
+    raise ValueError(f"time must be HH:MM, got {value!r}")
+
+
+def with_fallback(llm: LLM | None, ai_call: Callable[[LLM], T], rules_call: Callable[[], T]) -> tuple[T, str | None]:
+    """Run `ai_call(llm)`, or the rule-based `rules_call()` when there's no model or the model fails.
+
+    Returns (result, note), where note tells the user why the built-in rules were used (None if the AI answered).
+    """
+    if llm is None:
+        return rules_call(), "AI is off, so PawPal+'s built-in rules handled this."
     try:
-        return datetime.strptime(str(value).strip(), "%H:%M").time()
-    except ValueError:
-        raise ValueError(f"time must be HH:MM, got {value!r}") from None
+        return ai_call(llm), None
+    except LLMError as e:
+        return rules_call(), f"The AI couldn't answer ({e}), so PawPal+'s built-in rules handled this."
 
 
 @dataclass
@@ -38,6 +63,8 @@ class TaskDraft:
     preferred_time: time | None = None
     frequency: str = "daily"
     rationale: str = ""  # why the AI suggested it (task ideas only)
+    not_before: time | None = None
+    done_by: time | None = None
 
     def to_task(self, start_date: date | None = None) -> Task:
         """Build the real Task, which raises ValueError if any field is invalid."""
@@ -48,6 +75,8 @@ class TaskDraft:
             preferred_time=self.preferred_time,
             frequency=self.frequency,
             start_date=start_date or date.today(),
+            not_before=self.not_before,
+            done_by=self.done_by,
         )
 
 
@@ -73,6 +102,8 @@ def draft_from_json(data: Any, owner: Owner) -> TaskDraft:
         parse_time(data.get("preferred_time")),
         str(data.get("frequency") or "daily").lower(),
         str(data.get("rationale") or "").strip(),
+        parse_time(data.get("not_before")),
+        parse_time(data.get("done_by")),
     )
     if not draft.title:
         raise ValueError("the task needs a title")
@@ -84,13 +115,16 @@ TASK_FIELDS = """Task fields:
 - "pet_name": one of the owner's pets
 - "title": short task name, e.g. "Morning walk"
 - "duration_minutes": whole number; estimate a typical duration if none is given
-- "priority": "low", "medium", or "high"
-- "preferred_time": "HH:MM" (24-hour) only if a clock time is given, otherwise null
+- "priority": "low", "medium", "high", or "critical" (critical tasks, like medication, are never bumped for other tasks)
+- "preferred_time": "HH:MM" (24-hour) only if an exact clock time is given ("at 7:30"), otherwise null
+- "not_before": "HH:MM" if it must start after a time ("after 17:00"), otherwise null
+- "done_by": "HH:MM" if it must be finished by a time ("before 9am", "by noon"), otherwise null
 - "frequency": "daily" or "weekly\""""
 
 PARSE_SYSTEM = f"""You turn a pet owner's description of a care task into structured fields.
 {TASK_FIELDS}
-Use "high" priority for words like "important", "must", or "critical", "low" for "if there's time", and "medium" otherwise.
+Use "critical" for words like "critical", "never skip", or "essential", "high" for "important" or "must",
+"low" for "if there's time", and "medium" otherwise.
 Reply with one JSON object containing exactly these fields."""
 
 
@@ -180,17 +214,21 @@ def apply_change(owner: Owner, change: dict, day: date) -> str:
         updates = {}
         if "priority" in args:
             updates["priority"] = args["priority"]
-        if "preferred_time" in args:
-            updates["preferred_time"] = parse_time(args["preferred_time"])
-        if "duration_minutes" in args:
-            updates["duration_minutes"] = int(args["duration_minutes"])
+        for name in ("preferred_time", "not_before", "done_by"):
+            if name in args:
+                updates[name] = parse_time(args[name])
+        for name in ("duration_minutes", "after_gap_minutes"):
+            if name in args:
+                updates[name] = int(args[name])
+        if "after" in args:
+            updates["after"] = str(args["after"] or "")
         if not updates:
-            raise ValueError("update_task needs priority, preferred_time, or duration_minutes")
-        checked = replace(task, **updates)  # a copy built through Task.__post_init__, so invalid values are rejected
-        for name in updates:
-            setattr(task, name, getattr(checked, name))
+            raise ValueError(
+                "update_task needs priority, preferred_time, duration_minutes, not_before, done_by, after, or after_gap_minutes"
+            )
+        task.update(**updates)  # validated on a copy first, so invalid values are rejected without a partial change
         details = ", ".join(
-            f"{name} → {fmt(value) if isinstance(value, time) else 'flexible' if value is None else getattr(value, 'name', value)}"
+            f"{name} → {fmt(value) if isinstance(value, time) else 'none' if value in (None, '') else getattr(value, 'name', value)}"
             for name, value in ((n, getattr(task, n)) for n in updates)
         )
         return f"Change {task.label}: {details.lower()}."
@@ -213,9 +251,9 @@ def plan_warnings(schedule: Schedule, changes: list[dict]) -> list[str]:
     """Automated checks on a proposed plan, shown to the user next to it."""
     warnings = [f"{c['description']} It won't be in this day's plan." for c in changes if c["tool"] == "defer_task"]
     warnings += [
-        f"High-priority task {t.label} isn't in the plan: {schedule.reasons[t]}."
+        f"{t.priority.name.title()}-priority task {t.label} isn't in the plan: {schedule.reasons[t]}."
         for t in schedule.skipped
-        if t.priority == Priority.HIGH
+        if t.priority >= Priority.HIGH
     ]
     if schedule.has_conflicts():
         warnings.append("Some planned tasks overlap.")
@@ -254,13 +292,16 @@ Reply with ONE JSON object: {"thought": "<short reasoning>", "actions": [{"tool"
 You may send several actions in one reply; they run in order.
 Tools:
 - set_available_time {"day_start": "HH:MM", "available_minutes": number}
-- update_task {"pet_name", "title", and any of "priority" ("low"/"medium"/"high"), "preferred_time" ("HH:MM" or "flexible"), "duration_minutes"}
+- update_task {"pet_name", "title", and any of "priority" ("low"/"medium"/"high"/"critical"), "preferred_time" ("HH:MM" or "flexible"),
+  "duration_minutes", "not_before" / "done_by" ("HH:MM" or null: the window the task must fit in),
+  "after" (title of the same pet's task that must come first, or ""), "after_gap_minutes"}
 - add_task {"pet_name", "title", "duration_minutes", "priority", "preferred_time", "frequency" ("daily"/"weekly")}
 - defer_task {"pet_name", "title"}: move a due task to the next day
 - search_guidelines {"query": "...", "pet_name": optional}: search older task history
 - finish {"summary": "<what you changed and why, written to the owner>"}
 Rules:
-- The scheduler decides the times; you only change settings.
+- The scheduler decides the times; you only change settings. A task that doesn't fit bumps strictly
+  lower-priority tasks, and overdue tasks gain priority each day, so raising a priority is often enough.
 - finish only takes effect in a reply with no changes, so you see the schedule your changes produce before finishing.
 - Follow the owner's guidelines and cite them like [Mochi guideline 1] in the summary.
 - Make the fewest changes that meet the goal. If the goal is already met, reply with only finish."""
@@ -281,14 +322,25 @@ class PlanningAgent:
         self.llm, self.owner, self.day, self.retriever, self.max_turns = llm, owner, day, retriever, max_turns
 
     def run(self, goal: str) -> PlanProposal:
-        """Run the plan → act → observe loop until the model finishes or max_turns is reached."""
+        """Run the plan → act → observe loop until the model finishes or max_turns is reached.
+
+        If the model fails on the first turn, the LLMError is raised so the caller can fall back. If it fails
+        later, the changes made so far are returned as a proposal with a warning.
+        """
         work = copy.deepcopy(self.owner)
         history = format_hits(self.retriever.search(
             " ".join([goal, *(t.title for t in work.all_tasks())]), source="history", k=5
         ))
         steps, changes, summary, warnings = [], [], "", []
         for turn in range(1, self.max_turns + 1):
-            reply = self.llm.generate_json(AGENT_SYSTEM, self._prompt(work, goal, history, steps))
+            try:
+                reply = self.llm.generate_json(AGENT_SYSTEM, self._prompt(work, goal, history, steps))
+            except LLMError as e:
+                if turn == 1:
+                    raise
+                turn -= 1  # this call produced nothing
+                warnings.append(f"The AI stopped responding after {turn} turn(s) ({e}). This is its unfinished plan.")
+                break
             reply = reply if isinstance(reply, dict) else {}
             thought = str(reply.get("thought") or "")
             actions = reply.get("actions") if isinstance(reply.get("actions"), list) else [reply] if "tool" in reply else []

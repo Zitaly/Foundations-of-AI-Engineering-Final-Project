@@ -1,0 +1,8 @@
+[theme]
+primaryColor = "#1c7ed6"
+borderColor = "#d0d7de"
+showWidgetBorder = true
+baseRadius = "medium"
+
+[client]
+toolbarMode = "minimal"
