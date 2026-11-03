@@ -112,6 +112,7 @@ class Pet:
     age: int = 0
     notes: str = ""
     tasks: list[Task] = field(default_factory=list)
+    guidelines: list[str] = field(default_factory=list)  # owner-written care rules the AI checks tasks against
 
     def add_task(self, task: Task) -> None:
         """Add a care task for this pet, moving it from its previous pet if it had one."""

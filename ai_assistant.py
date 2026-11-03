@@ -1,0 +1,324 @@
+"""AI features for PawPal+: natural-language task entry, task ideas, schedule explanations, and a planning agent.
+
+The model never edits the owner's data directly. Every task it drafts goes through Task's own validation,
+and the app only applies a draft or a plan after the user approves it.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, time, timedelta
+from typing import Any
+
+from llm import LLM
+from pawpal_system import Owner, Priority, Schedule, Task, fmt
+from rag import Retriever, describe_task, format_hits
+
+
+def parse_time(value: Any) -> time | None:
+    """Parse "HH:MM" (or "H:MM") into a time; empty, null, or "flexible" means no fixed time."""
+    if value is None or str(value).strip().lower() in ("", "null", "none", "flexible"):
+        return None
+    try:
+        return datetime.strptime(str(value).strip(), "%H:%M").time()
+    except ValueError:
+        raise ValueError(f"time must be HH:MM, got {value!r}") from None
+
+
+@dataclass
+class TaskDraft:
+    """A task proposed by the AI, waiting for the user to confirm it."""
+
+    pet_name: str
+    title: str
+    duration_minutes: int
+    priority: str = "medium"
+    preferred_time: time | None = None
+    frequency: str = "daily"
+    rationale: str = ""  # why the AI suggested it (task ideas only)
+
+    def to_task(self, start_date: date | None = None) -> Task:
+        """Build the real Task, which raises ValueError if any field is invalid."""
+        return Task(
+            self.title,
+            self.duration_minutes,
+            self.priority,
+            preferred_time=self.preferred_time,
+            frequency=self.frequency,
+            start_date=start_date or date.today(),
+        )
+
+
+def draft_from_json(data: Any, owner: Owner) -> TaskDraft:
+    """Turn model output into a TaskDraft, raising ValueError if it names an unknown pet or fails Task validation."""
+    if not isinstance(data, dict):
+        raise ValueError("expected a JSON object describing one task")
+    pets = {p.name.lower(): p.name for p in owner.pets}
+    pet_name = str(data.get("pet_name") or "").strip()
+    if not pet_name and len(owner.pets) == 1:
+        pet_name = owner.pets[0].name
+    if pet_name.lower() not in pets:
+        raise ValueError(f"unknown pet {pet_name!r}; pets are {', '.join(p.name for p in owner.pets)}")
+    try:
+        duration = int(data.get("duration_minutes"))
+    except (TypeError, ValueError):
+        raise ValueError("duration_minutes must be a whole number") from None
+    draft = TaskDraft(
+        pets[pet_name.lower()],
+        str(data.get("title") or "").strip(),
+        duration,
+        str(data.get("priority") or "medium").lower(),
+        parse_time(data.get("preferred_time")),
+        str(data.get("frequency") or "daily").lower(),
+        str(data.get("rationale") or "").strip(),
+    )
+    if not draft.title:
+        raise ValueError("the task needs a title")
+    draft.to_task()  # run Task's validation now, so a bad draft fails before the user reviews it
+    return draft
+
+
+TASK_FIELDS = """Task fields:
+- "pet_name": one of the owner's pets
+- "title": short task name, e.g. "Morning walk"
+- "duration_minutes": whole number; estimate a typical duration if none is given
+- "priority": "low", "medium", or "high"
+- "preferred_time": "HH:MM" (24-hour) only if a clock time is given, otherwise null
+- "frequency": "daily" or "weekly\""""
+
+PARSE_SYSTEM = f"""You turn a pet owner's description of a care task into structured fields.
+{TASK_FIELDS}
+Use "high" priority for words like "important", "must", or "critical", "low" for "if there's time", and "medium" otherwise.
+Reply with one JSON object containing exactly these fields."""
+
+
+def parse_task(llm: LLM, text: str, owner: Owner) -> TaskDraft:
+    """Draft a task from a plain-English description. The user reviews the draft before it is added."""
+    if not owner.pets:
+        raise ValueError("add a pet before adding tasks")
+    pets = ", ".join(f"{p.name} ({p.species})" for p in owner.pets)
+    return draft_from_json(llm.generate_json(PARSE_SYSTEM, f"Pets: {pets}\n\nDescription: {text}"), owner)
+
+
+IDEAS_SYSTEM = f"""You suggest care tasks a pet is missing, based on its species, age, notes, the owner's guidelines, and recent history.
+Do not repeat tasks the pet already has. Prefer tasks that address a guideline or a gap in the history.
+{TASK_FIELDS}
+- "rationale": one sentence on why this pet needs it; cite a source in [brackets] if you used one
+Reply with JSON: {{"ideas": [<task>, ...]}}"""
+
+
+def suggest_tasks(llm: LLM, owner: Owner, pet, retriever: Retriever, day: date, count: int = 3) -> list[TaskDraft]:
+    """Suggest up to `count` new tasks for `pet`. Invalid ideas and ones the pet already has are dropped."""
+    current = [t for t in pet.tasks if not t.is_completed(day)]
+    query = " ".join([pet.species, pet.notes, *pet.guidelines, *(t.title for t in current)])
+    prompt = (
+        f"Pet: {pet.name}, a {pet.age}-year-old {pet.species}. Notes: {pet.notes or 'none'}\n\n"
+        f"Current tasks:\n" + ("\n".join(f"- {describe_task(t, day)}" for t in current) or "- (none)")
+        + f"\n\nGuidelines and history:\n{format_hits(retriever.search(query, pet_name=pet.name, k=8))}\n\n"
+        f"Suggest up to {count} tasks."
+    )
+    reply = llm.generate_json(IDEAS_SYSTEM, prompt)
+    seen = {t.title.lower() for t in current}
+    ideas = []
+    for item in reply.get("ideas", []) if isinstance(reply, dict) else []:
+        try:
+            draft = draft_from_json({**item, "pet_name": pet.name}, owner) if isinstance(item, dict) else None
+        except ValueError:
+            continue
+        if draft and draft.title.lower() not in seen:
+            seen.add(draft.title.lower())
+            ideas.append(draft)
+    return ideas[:count]
+
+
+EXPLAIN_SYSTEM = """You explain a pet care schedule to its owner in friendly, plain language.
+Use only the facts provided. Never change times or invent tasks.
+Mention anything that was skipped or moved and why, and give at most two concrete suggestions.
+Keep it under 150 words."""
+
+
+def explain_schedule(llm: LLM, schedule: Schedule, retriever: Retriever) -> str:
+    """Rewrite schedule.explain() for the owner, adding relevant history (e.g. a task skipped on earlier days)."""
+    flagged = [t for t in schedule.reasons if t in schedule.skipped or t.is_overdue(schedule.day) or t in schedule.conflicts]
+    history = retriever.search(" ".join(t.label for t in flagged), source="history", k=5) if flagged else []
+    prompt = f"Schedule:\n{schedule.explain()}\n\nRelated history:\n{format_hits(history)}"
+    return llm.generate_text(EXPLAIN_SYSTEM, prompt)
+
+
+# ---- Planning agent ----
+
+def find_task(owner: Owner, pet_name: Any, title: Any, day: date) -> Task:
+    """Return the task with this title that is due on `day` for this pet (names compared case-insensitively)."""
+    pet = next((p for p in owner.pets if p.name.lower() == str(pet_name).strip().lower()), None)
+    if pet is None:
+        raise ValueError(f"unknown pet {pet_name!r}")
+    due = pet.due_tasks(day)
+    task = next((t for t in due if t.title.lower() == str(title).strip().lower()), None)
+    if task is None:
+        titles = ", ".join(t.title for t in due) or "none"
+        raise ValueError(f"{pet.name} has no task titled {title!r} due on {day}; due tasks: {titles}")
+    return task
+
+
+def apply_change(owner: Owner, change: dict, day: date) -> str:
+    """Apply one agent change ({"tool": ..., "args": {...}}) to `owner` and describe it. Raises ValueError if invalid."""
+    tool, args = change["tool"], change["args"]
+    if tool == "set_available_time":
+        start = parse_time(args.get("day_start")) or owner.day_start
+        minutes = int(args.get("available_minutes", owner.available_minutes))
+        owner.set_window(start, minutes)
+        return f"Available time set to {fmt(start)}-{fmt(owner.day_end)} ({minutes} min). This applies to every day."
+    if tool == "add_task":
+        draft = draft_from_json(args, owner)
+        pet = next(p for p in owner.pets if p.name == draft.pet_name)
+        pet.add_task(draft.to_task(day))
+        return f"Add {draft.pet_name}: {draft.title} ({draft.duration_minutes} min, {draft.priority})."
+    if tool == "update_task":
+        task = find_task(owner, args.get("pet_name"), args.get("title"), day)
+        updates = {}
+        if "priority" in args:
+            updates["priority"] = args["priority"]
+        if "preferred_time" in args:
+            updates["preferred_time"] = parse_time(args["preferred_time"])
+        if "duration_minutes" in args:
+            updates["duration_minutes"] = int(args["duration_minutes"])
+        if not updates:
+            raise ValueError("update_task needs priority, preferred_time, or duration_minutes")
+        checked = replace(task, **updates)  # a copy built through Task.__post_init__, so invalid values are rejected
+        for name in updates:
+            setattr(task, name, getattr(checked, name))
+        details = ", ".join(
+            f"{name} → {fmt(value) if isinstance(value, time) else 'flexible' if value is None else getattr(value, 'name', value)}"
+            for name, value in ((n, getattr(task, n)) for n in updates)
+        )
+        return f"Change {task.label}: {details.lower()}."
+    if tool == "defer_task":
+        task = find_task(owner, args.get("pet_name"), args.get("title"), day)
+        task.start_date = day + timedelta(days=1)
+        return f"Defer {task.label} to {task.start_date:%a %b %d}."
+    raise ValueError(f"unknown change {tool!r}")
+
+
+def apply_changes(owner: Owner, changes: list[dict], day: date) -> list[str]:
+    """Apply an approved plan's changes to the real owner. All are tried on a copy first, so it's all or nothing."""
+    trial = copy.deepcopy(owner)
+    for change in changes:
+        apply_change(trial, change, day)
+    return [apply_change(owner, change, day) for change in changes]
+
+
+def plan_warnings(schedule: Schedule, changes: list[dict]) -> list[str]:
+    """Automated checks on a proposed plan, shown to the user next to it."""
+    warnings = [f"{c['description']} It won't be in this day's plan." for c in changes if c["tool"] == "defer_task"]
+    warnings += [
+        f"High-priority task {t.label} isn't in the plan: {schedule.reasons[t]}."
+        for t in schedule.skipped
+        if t.priority == Priority.HIGH
+    ]
+    if schedule.has_conflicts():
+        warnings.append("Some planned tasks overlap.")
+    return warnings
+
+
+@dataclass
+class AgentStep:
+    """One tool call the agent made and what it got back."""
+
+    thought: str
+    tool: str
+    args: dict
+    result: str
+
+
+@dataclass
+class PlanProposal:
+    """A plan the agent built on a copy of the owner's data, waiting for the user's approval."""
+
+    goal: str
+    day: date
+    changes: list[dict]  # {"tool", "args", "description"}, replayed by apply_changes on approval
+    schedule: Schedule
+    summary: str = ""
+    steps: list[AgentStep] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+AGENT_SYSTEM = """You are PawPal+'s planning agent. You prepare a proposed plan for one day; the owner reviews it,
+and nothing you do is final until they approve it.
+Work step by step. Each turn, reply with ONE JSON object: {"thought": "<short reasoning>", "tool": "<name>", "args": {...}}
+Tools:
+- list_tasks {"pet_name": optional}: tasks due on the plan day
+- generate_schedule {}: run the scheduler and see what is planned, skipped, and why
+- search_guidelines {"query": "...", "pet_name": optional}: the owner's care guidelines and recent task history
+- set_available_time {"day_start": "HH:MM", "available_minutes": number}
+- update_task {"pet_name", "title", and any of "priority" ("low"/"medium"/"high"), "preferred_time" ("HH:MM" or "flexible"), "duration_minutes"}
+- add_task {"pet_name", "title", "duration_minutes", "priority", "preferred_time", "frequency" ("daily"/"weekly")}
+- defer_task {"pet_name", "title"}: move a due task to the next day
+- finish {"summary": "<what you changed and why, written to the owner>"}
+Rules:
+- The scheduler decides the times; you only change settings. Run generate_schedule after making changes and before finishing.
+- Check search_guidelines before lowering a priority or deferring a task, and follow the owner's guidelines.
+- Make the fewest changes that meet the goal. If the goal is already met, finish without changes."""
+
+CHANGE_TOOLS = {"set_available_time", "add_task", "update_task", "defer_task"}
+
+
+class PlanningAgent:
+    """Plans a day by calling PawPal+'s own methods as tools, on a copy of the owner's data."""
+
+    def __init__(self, llm: LLM, owner: Owner, day: date, retriever: Retriever, max_steps: int = 10):
+        self.llm, self.owner, self.day, self.retriever, self.max_steps = llm, owner, day, retriever, max_steps
+
+    def run(self, goal: str) -> PlanProposal:
+        """Run the plan → act → observe loop until the model calls finish or max_steps is reached."""
+        work = copy.deepcopy(self.owner)
+        steps, changes, summary, warnings = [], [], "", []
+        for _ in range(self.max_steps):
+            action = self.llm.generate_json(AGENT_SYSTEM, self._prompt(work, goal, steps))
+            if not isinstance(action, dict):
+                action = {}
+            tool, args = str(action.get("tool") or ""), action.get("args") or {}
+            if tool == "finish":
+                summary = str(args.get("summary") or "").strip() if isinstance(args, dict) else ""
+                break
+            result = self._call_tool(work, tool, args, changes) if isinstance(args, dict) else "error: args must be an object"
+            steps.append(AgentStep(str(action.get("thought") or ""), tool, args, result))
+        else:
+            warnings.append(f"The agent stopped after {self.max_steps} steps without finishing. Review its changes carefully.")
+        schedule = work.create_schedule(self.day)
+        return PlanProposal(goal, self.day, changes, schedule, summary, steps, warnings + plan_warnings(schedule, changes))
+
+    def _prompt(self, work: Owner, goal: str, steps: list[AgentStep]) -> str:
+        """The day's context, the owner's goal, and every step so far."""
+        lines = [
+            f"Plan day: {self.day:%A %b %d %Y}",
+            f"Owner: {work.name}, available {fmt(work.day_start)}-{fmt(work.day_end)} ({work.available_minutes} min)",
+            f"Pets: {', '.join(f'{p.name} ({p.species}, {p.age})' for p in work.pets)}",
+            f"\nGoal from the owner:\n{goal}\n",
+        ]
+        for i, step in enumerate(steps, 1):
+            lines.append(f"Step {i}: {step.tool} {json.dumps(step.args)}\nResult:\n{step.result}\n")
+        lines.append("What is your next action?")
+        return "\n".join(lines)
+
+    def _call_tool(self, work: Owner, tool: str, args: dict, changes: list[dict]) -> str:
+        """Run one tool against the working copy. Errors are returned as text so the agent can correct itself."""
+        try:
+            if tool == "list_tasks":
+                pet_name = str(args.get("pet_name") or "").lower()
+                tasks = [t for p in work.pets if not pet_name or p.name.lower() == pet_name for t in p.due_tasks(self.day)]
+                return "\n".join(describe_task(t, self.day) for t in tasks) or "No tasks are due."
+            if tool == "generate_schedule":
+                return work.create_schedule(self.day).explain()
+            if tool == "search_guidelines":
+                return format_hits(self.retriever.search(str(args.get("query") or ""), pet_name=args.get("pet_name") or None, k=5))
+            if tool in CHANGE_TOOLS:
+                change = {"tool": tool, "args": args}
+                change["description"] = apply_change(work, change, self.day)
+                changes.append(change)
+                return f"done: {change['description']}"
+            return f"error: unknown tool {tool!r}"
+        except (TypeError, ValueError) as e:
+            return f"error: {e}"

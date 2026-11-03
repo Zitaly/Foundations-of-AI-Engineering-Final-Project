@@ -1,0 +1,117 @@
+%% PawPal+ planned AI system: components, data flow, and human/testing checkpoints.
+%% Solid arrows = data flow. Dotted arrows = verification (human review or automated tests).
+flowchart TD
+    User(["👤 Pet owner"])
+
+    subgraph UI["Streamlit UI (app.py)"]
+        NLInput["Type a task in plain English"]
+        IdeasBtn["Ask for task ideas"]
+        PlanBtn["Ask for an automatic plan"]
+        GuideEditor["Write per-pet care guidelines"]
+        ScheduleView["Schedule view + Explain"]
+    end
+
+    subgraph AI["AI layer (ai_assistant.py)"]
+        Parser["NL task parser<br/>text → Task fields (JSON)"]
+        Ideas["Task idea generator<br/>uses species, age, notes"]
+        Explainer["Schedule explainer<br/>rewrites explain() in plain language"]
+    end
+
+    LLM[["LLM API"]]
+
+    subgraph RAG["RAG (rag.py)"]
+        GuideStore[("Pet guidelines<br/>user-created, one set per pet")]
+        HistoryStore[("Task history<br/>completions, overdue, past schedules<br/>second source")]
+        Retriever["Retriever<br/>top-k chunks for a pet + query"]
+        Checker["Guideline checker<br/>compares tasks against guidelines"]
+    end
+
+    subgraph Agent["Planning agent (ai_assistant.py)"]
+        Loop["Agent loop<br/>plan → call tool → observe → revise"]
+        Tools["Tools wrapping existing methods<br/>list_tasks · add_task · remove_task<br/>generate_schedule · search_guidelines"]
+    end
+
+    subgraph Core["Core system (pawpal_system.py)"]
+        Validate{"Task.__post_init__<br/>validation"}
+        Model["Owner / Pet / Task"]
+        Scheduler["Schedule.generate()<br/>deterministic placement + reasons"]
+    end
+
+    subgraph Review["🧑 Human review checkpoints"]
+        ReviewTask{"Confirm or edit<br/>parsed task"}
+        ReviewIdeas{"Accept or reject<br/>each idea"}
+        ReviewPlan{"Approve, edit, or reject<br/>proposed plan (shown as diff)"}
+        ReviewWarn["Read guideline warnings<br/>with cited source"]
+    end
+
+    subgraph Tests["🧪 Automated testing"]
+        UnitTests["Existing pytest suite<br/>scheduler + model behavior"]
+        MockTests["AI tests with mocked LLM<br/>parser output, tool calls, agent stop conditions"]
+        RetrievalEval["Retrieval eval<br/>query → expected guideline chunk"]
+        SafetyCheck["Plan checks<br/>has_conflicts() is False, required tasks planned"]
+    end
+
+    %% Typing a task
+    User --> NLInput --> Parser
+    Parser <--> LLM
+    Parser -- "proposed Task fields" --> ReviewTask
+    ReviewTask -- "confirmed" --> Validate
+    ReviewTask -- "edit" --> NLInput
+    Validate -- "valid" --> Model
+    Validate -- "error message" --> ReviewTask
+
+    %% Task ideas
+    User --> IdeasBtn --> Ideas
+    Model -- "pet characteristics" --> Ideas
+    Retriever -- "relevant guidelines + history" --> Ideas
+    Ideas <--> LLM
+    Ideas -- "suggested tasks" --> ReviewIdeas
+    ReviewIdeas -- "accepted" --> Validate
+
+    %% Guidelines and history (RAG)
+    User --> GuideEditor --> GuideStore
+    Model -- "completions, overdue tasks" --> HistoryStore
+    Scheduler -- "past schedules" --> HistoryStore
+    GuideStore --> Retriever
+    HistoryStore --> Retriever
+    Model -- "current tasks" --> Checker
+    Retriever --> Checker
+    Checker <--> LLM
+    Checker -- "violations + source" --> ReviewWarn
+    ReviewWarn --> User
+
+    %% Explain
+    Model --> Scheduler
+    Scheduler -- "planned, skipped, reasons" --> Explainer
+    Retriever -- "history context" --> Explainer
+    Explainer <--> LLM
+    Explainer --> ScheduleView --> User
+
+    %% Agentic planning
+    User --> PlanBtn --> Loop
+    Loop <--> LLM
+    Loop <--> Tools
+    Tools -- "read / draft changes" --> Model
+    Tools -- "run" --> Scheduler
+    Tools -- "search_guidelines" --> Retriever
+    Loop -- "proposed plan + changes" --> ReviewPlan
+    ReviewPlan -- "approved" --> Validate
+    ReviewPlan -- "rejected, with feedback" --> Loop
+
+    %% Verification
+    UnitTests -.-> Scheduler
+    UnitTests -.-> Validate
+    MockTests -.-> Parser
+    MockTests -.-> Ideas
+    MockTests -.-> Loop
+    RetrievalEval -.-> Retriever
+    SafetyCheck -.-> Loop
+
+    classDef human fill:#fde68a,stroke:#b45309,color:#000
+    classDef test fill:#bbf7d0,stroke:#15803d,color:#000
+    classDef ai fill:#ddd6fe,stroke:#6d28d9,color:#000
+    classDef data fill:#bae6fd,stroke:#0369a1,color:#000
+    class User,ReviewTask,ReviewIdeas,ReviewPlan,ReviewWarn human
+    class UnitTests,MockTests,RetrievalEval,SafetyCheck test
+    class Parser,Ideas,Explainer,Loop,Tools,Checker,LLM ai
+    class GuideStore,HistoryStore data

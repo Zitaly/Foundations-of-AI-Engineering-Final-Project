@@ -1,2 +1,4 @@
 streamlit>=1.36
 pytest>=7.0
+pandas
+google-genai>=1.0
