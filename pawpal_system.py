@@ -443,7 +443,8 @@ class Schedule:
             start = task.preferred_time
             end = add_minutes(start, task.duration_minutes)
             if start < window_start or end > window_end or end < start:
-                self._skip(task, f"fixed at {fmt(start)}, outside available time {fmt(window_start)}-{fmt(window_end)}")
+                why = f"starts before {fmt(window_start)}" if start < window_start else f"would end at {fmt(end)}"
+                self._skip(task, f"fixed at {fmt(start)}, outside available time {fmt(window_start)}-{fmt(window_end)} ({why})")
                 continue
             low, high = self._bounds(task)
             out_of_order = self._offset(start) < low or self._offset(start) + task.duration_minutes > high
@@ -569,6 +570,10 @@ class Schedule:
         low, high = self._bounds(task)
         if (low, high) == (0, self.owner.available_minutes):
             reason = f"needs {task.duration_minutes} min, largest free slot is {largest} min"
+        elif task.not_before and self._offset(task.not_before) >= self.owner.available_minutes:
+            reason = f"can't start before {fmt(task.not_before)}, but the available time ends at {fmt(self.owner.day_end)}"
+        elif task.done_by and self._offset(task.done_by) <= 0:
+            reason = f"must be done by {fmt(task.done_by)}, but the available time starts at {fmt(self.owner.day_start)}"
         else:
             window = f"{fmt(add_minutes(self.owner.day_start, low))}-{fmt(add_minutes(self.owner.day_start, max(high, low)))}"
             reason = f"needs {task.duration_minutes} min within {window}, largest free slot there is {largest} min"

@@ -270,3 +270,23 @@ def test_setup_logging_writes_a_redacted_file_once(tmp_path, monkeypatch):
         for handler in root.handlers:
             handler.close()
         root.handlers[:], root.level, root.propagate = saved
+
+
+def test_repeated_changes_are_not_counted_so_the_agent_can_finish():
+    owner = make_owner()
+    llm = FakeLLM(
+        act(("update_task", {"pet_name": "Mochi", "title": "Fetch", "preferred_time": "flexible"}),
+            ("finish", {"summary": "Fetch was already flexible."})),
+    )
+    proposal = PlanningAgent(llm, owner, DAY, retriever_for(owner)).run("keep fetch flexible")
+
+    assert proposal.changes == [] and proposal.turns == 1
+    assert proposal.steps[0].result.startswith("no change:")
+    assert proposal.summary == "Fetch was already flexible."
+
+
+def test_prompts_show_each_task_window_and_order():
+    from rag import describe_task
+
+    meds = Task("Meds", 5, "critical", done_by=time(9, 0), after="Breakfast", after_gap_minutes=15, start_date=DAY)
+    assert "flexible time (done by 09:00, after Breakfast +15 min)" in describe_task(meds, DAY)

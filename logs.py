@@ -49,25 +49,26 @@ recent = RecentHandler()
 recent.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
 
 
-def setup_logging(level: str | None = None, log_dir: Path | None = LOG_DIR) -> logging.Logger:
+def setup_logging(level: str | None = None, log_dir: Path | None = LOG_DIR, console: bool = True) -> logging.Logger:
     """Configure the "pawpal" logger once (later calls do nothing) and return it.
 
-    The level comes from `level`, else PAWPAL_LOG_LEVEL, else INFO. Pass log_dir=None to skip the file.
+    The level comes from `level`, else PAWPAL_LOG_LEVEL, else INFO. Pass log_dir=None to skip the file, and
+    console=False to keep warnings off the terminal (the CLI shows them in its own output).
     """
     root = logging.getLogger("pawpal")
     if recent in root.handlers:
         return root
     root.setLevel((level or os.environ.get("PAWPAL_LOG_LEVEL", "INFO")).upper())
     root.propagate = False  # keep PawPal+ lines out of Streamlit's own log output
-    console = logging.StreamHandler()
-    console.setLevel(logging.WARNING)
-    handlers: list[logging.Handler] = [console, recent]
+    stderr = logging.StreamHandler()
+    stderr.setLevel(logging.WARNING)
+    handlers: list[logging.Handler] = [stderr, recent] if console else [recent]
     if log_dir is not None:
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
             handlers.append(RotatingFileHandler(log_dir / "pawpal.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"))
         except OSError as e:
-            console.handle(logging.makeLogRecord({"msg": f"File logging disabled: {e}", "levelno": logging.WARNING, "levelname": "WARNING"}))
+            stderr.handle(logging.makeLogRecord({"msg": f"File logging disabled: {e}", "levelno": logging.WARNING, "levelname": "WARNING"}))
     for handler in handlers:
         handler.addFilter(RedactFilter())
         if handler is not recent:

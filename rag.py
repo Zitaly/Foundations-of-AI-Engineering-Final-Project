@@ -40,6 +40,8 @@ class Document:
 def describe_task(task: Task, day: date) -> str:
     """One-line summary of a task and its status on `day`, for prompts."""
     when = f"fixed at {fmt(task.preferred_time)}" if task.preferred_time else "flexible time"
+    if task.timing_label:
+        when += f" ({task.timing_label})"  # e.g. "(done by 09:00, after Breakfast +15 min)"
     if task.is_completed(day):
         status = "done"
     elif task.is_overdue(day):
@@ -134,6 +136,8 @@ class GuidelineIssue:
 
 CHECK_SYSTEM = """You audit pets' care tasks against the owner's own numbered guidelines for each pet.
 Only report a problem when a pet's current tasks or history clearly break one of that pet's guidelines.
+A guideline also counts as broken when it calls for care the pet has no task for (e.g. "brush coat weekly" with no brushing task).
+A task's time window counts: "flexible time (done by 09:00)" always finishes by 09:00.
 Do not invent guidelines or facts.
 Reply with JSON: {"issues": [{"pet": "<pet name>", "guideline": <guideline number>, "issue": "<what is wrong>", "suggestion": "<one concrete fix>"}]}
 Use {"issues": []} if the tasks follow every guideline.

@@ -356,3 +356,35 @@ class FallbackLLM:
 
     def generate_json(self, system: str, prompt: str) -> Any:
         return self._first_answer("generate_json", system, prompt)
+
+
+SECRETS_PATH = Path(__file__).parent / ".streamlit" / "secrets.toml"
+
+
+def read_secrets(path: Path = SECRETS_PATH) -> dict:
+    """Keys from .streamlit/secrets.toml (the file the Streamlit app reads), or {} if it's missing or unreadable."""
+    import tomllib
+
+    try:
+        with open(path, "rb") as file:
+            return tomllib.load(file)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def build_llm(gemini_key: str | None, groq_key: str | None) -> tuple[FallbackLLM | None, list[str]]:
+    """Gemini, then Groq, for whichever keys are given.
+
+    Returns the chain (None if no provider is available) and any setup problems to show.
+    """
+    providers, problems = [], []
+    for name, key, cls in (("Gemini", gemini_key, GeminiLLM), ("Groq", groq_key, GroqLLM)):
+        if not key:
+            continue
+        try:
+            providers.append(cls(api_key=key))
+        except (LLMError, ImportError) as e:
+            problems.append(f"{name} unavailable: {e}")
+    for provider in providers[:-1]:
+        provider.max_wait = 0  # don't wait for a busy provider when the next one can answer now
+    return (FallbackLLM(providers) if providers else None), problems

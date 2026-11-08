@@ -544,7 +544,7 @@ def test_fixed_task_before_day_start_is_skipped():
     schedule = owner.create_schedule(DAY)
 
     assert schedule.skipped == [walk]
-    assert schedule.reasons[walk] == "fixed at 07:59, outside available time 08:00-10:00"
+    assert schedule.reasons[walk] == "fixed at 07:59, outside available time 08:00-10:00 (starts before 08:00)"
 
 
 def test_task_longer_than_window_is_skipped():
@@ -896,3 +896,20 @@ def test_update_validates_before_changing_anything():
 
     walk.update(priority="high", not_before=time(9, 0))
     assert (walk.priority, walk.not_before) == (Priority.HIGH, time(9, 0))
+
+
+def test_skip_reasons_say_why_a_task_cannot_fit_the_day():
+    owner = Owner("Jordan", available_minutes=45, day_start=time(7, 0))
+    mochi = Pet("Mochi", "dog")
+    owner.add_pet(mochi)
+    walk = Task("Walk", 30, "high", preferred_time=time(7, 20), start_date=date(2026, 10, 5))
+    evening = Task("Evening walk", 30, "medium", not_before=time(17, 0), start_date=date(2026, 10, 5))
+    early = Task("Early meds", 5, "high", done_by=time(6, 30), start_date=date(2026, 10, 5))
+    for task in (walk, evening, early):
+        mochi.add_task(task)
+
+    reasons = owner.create_schedule(date(2026, 10, 5)).reasons
+
+    assert reasons[walk] == "fixed at 07:20, outside available time 07:00-07:45 (would end at 07:50)"
+    assert reasons[evening] == "can't start before 17:00, but the available time ends at 07:45"
+    assert reasons[early] == "must be done by 06:30, but the available time starts at 07:00"

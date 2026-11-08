@@ -31,6 +31,7 @@ from guardrails import (
 from llm import LLM, LLMError
 from pawpal_system import Owner, Priority, Schedule, Task, fmt
 from rag import Retriever, describe_task, format_hits
+from storage import dumps
 
 T = TypeVar("T")
 log = logging.getLogger("pawpal.ai")
@@ -344,6 +345,9 @@ Tools:
 Rules:
 - The scheduler decides the times; you only change settings. A task that doesn't fit bumps strictly
   lower-priority tasks, and overdue tasks gain priority each day, so raising a priority is often enough.
+- A fixed-time task is skipped if it would end after the available time. Moving tasks can't create minutes:
+  if the tasks the owner needs add up to more than the available time, shorten one (duration_minutes)
+  or defer a lower-priority one.
 - finish only takes effect in a reply with no changes, so you see the schedule your changes produce before finishing.
 - Follow the owner's guidelines and cite them like [Mochi guideline 1] in the summary.
 - Make the fewest changes that meet the goal. If the goal is already met, reply with only finish.
@@ -462,7 +466,10 @@ class PlanningAgent:
             if tool in CHANGE_TOOLS:
                 change = {"tool": tool, "args": args}
                 check_change(work, change, changes, self.day)
+                before = dumps(work)
                 change["description"] = apply_change(work, change, self.day)
+                if dumps(work) == before:  # not counted, so a repeated change doesn't block finishing
+                    return f"no change: {change['description']} It already had those settings."
                 changes.append(change)
                 log.info("Planning agent: %s", change["description"])
                 return f"done: {change['description']}"

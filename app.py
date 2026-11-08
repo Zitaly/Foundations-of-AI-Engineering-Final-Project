@@ -23,7 +23,7 @@ from guardrails import (
     QuotaLLM,
     SessionQuota,
 )
-from llm import FallbackLLM, GeminiLLM, GroqLLM, LLMError, get_api_key, get_groq_key
+from llm import FallbackLLM, build_llm, get_api_key, get_groq_key
 from logs import recent, setup_logging
 from offline import (
     check_guidelines_rules,
@@ -105,17 +105,7 @@ def make_llm(gemini_key: str | None, groq_key: str | None) -> tuple[FallbackLLM 
 
     Returns the chain (None if no provider is available) and any setup problems to show.
     """
-    providers, problems = [], []
-    for name, key, cls in (("Gemini", gemini_key, GeminiLLM), ("Groq", groq_key, GroqLLM)):
-        if not key:
-            continue
-        try:
-            providers.append(cls(api_key=key))
-        except (LLMError, ImportError) as e:
-            problems.append(f"{name} unavailable: {e}")
-    for provider in providers[:-1]:
-        provider.max_wait = 0  # don't wait for a busy provider when the next one can answer now
-    return (FallbackLLM(providers) if providers else None), problems
+    return build_llm(gemini_key, groq_key)
 
 
 shared_llm, llm_problems = make_llm(secret("GEMINI_API_KEY", get_api_key()), secret("GROQ_API_KEY", get_groq_key()))
