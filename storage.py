@@ -6,6 +6,7 @@ Writes go to a temporary file that then replaces the real one, so a crash mid-sa
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import date, datetime, time
 from pathlib import Path
@@ -15,6 +16,8 @@ from pawpal_system import Owner, Pet, Schedule, Task, fmt
 
 SCHEMA_VERSION = 1
 DEFAULT_PATH = Path(os.environ.get("PAWPAL_DATA", Path(__file__).parent / "data" / "pawpal.json"))
+
+log = logging.getLogger("pawpal.storage")
 
 
 class StorageError(ValueError):
@@ -142,17 +145,26 @@ def save(owner: Owner, path: Path = DEFAULT_PATH) -> None:
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(dumps(owner), encoding="utf-8")
     os.replace(temp, path)
+    log.debug("Saved %d pet(s) and %d task(s) to %s", len(owner.pets), len(owner.all_tasks()), path.name)
 
 
 def load(path: Path = DEFAULT_PATH) -> Owner | None:
     """The saved Owner, or None if nothing has been saved yet. Raises StorageError if the file is unreadable."""
     if not path.exists():
+        log.info("No saved data at %s; starting fresh", path.name)
         return None
-    return loads(path.read_text(encoding="utf-8"))
+    try:
+        owner = loads(path.read_text(encoding="utf-8"))
+    except StorageError as e:
+        log.error("Couldn't read %s: %s", path.name, e)
+        raise
+    log.info("Loaded %d pet(s) and %d task(s) from %s", len(owner.pets), len(owner.all_tasks()), path.name)
+    return owner
 
 
 def quarantine(path: Path = DEFAULT_PATH) -> Path:
     """Move an unreadable save file aside (so it isn't overwritten) and return its new path."""
     backup = path.with_name(f"{path.stem}.unreadable-{datetime.now():%Y%m%d-%H%M%S}{path.suffix}")
     os.replace(path, backup)
+    log.warning("Moved unreadable save file to %s", backup.name)
     return backup

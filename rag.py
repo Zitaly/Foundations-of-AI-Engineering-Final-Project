@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from guardrails import DATA_RULE, as_data
 from llm import LLM
 from pawpal_system import Owner, Task, fmt
 
@@ -135,7 +136,8 @@ CHECK_SYSTEM = """You audit pets' care tasks against the owner's own numbered gu
 Only report a problem when a pet's current tasks or history clearly break one of that pet's guidelines.
 Do not invent guidelines or facts.
 Reply with JSON: {"issues": [{"pet": "<pet name>", "guideline": <guideline number>, "issue": "<what is wrong>", "suggestion": "<one concrete fix>"}]}
-Use {"issues": []} if the tasks follow every guideline."""
+Use {"issues": []} if the tasks follow every guideline.
+""" + DATA_RULE
 
 
 def check_guidelines(llm: LLM, owner: Owner, retriever: Retriever, day: date) -> list[GuidelineIssue]:
@@ -152,7 +154,7 @@ def check_guidelines(llm: LLM, owner: Owner, retriever: Retriever, day: date) ->
             f"## {pet.name} ({pet.species}, {pet.age} years). Notes: {pet.notes or 'none'}\n"
             f"Guidelines:\n{guidelines}\nCurrent tasks:\n{tasks}\nRecent history:\n{format_hits(history)}"
         )
-    reply = llm.generate_json(CHECK_SYSTEM, "\n\n".join(sections))
+    reply = llm.generate_json(CHECK_SYSTEM, as_data("\n\n".join(sections)))
     issues = []
     for item in reply.get("issues", []) if isinstance(reply, dict) else []:
         if not isinstance(item, dict):

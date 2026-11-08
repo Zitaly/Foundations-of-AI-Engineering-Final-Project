@@ -22,6 +22,14 @@ flowchart TD
     end
     Rules["Built-in rules (offline.py)<br/>used when every provider fails<br/>or no key is set"]
 
+    subgraph Guard["Guardrails (guardrails.py)"]
+        InputGuard["Input limits<br/>length caps · control chars stripped<br/>owner text fenced as &lt;data&gt;"]
+        Quota["Session quota<br/>50 AI requests, then built-in rules"]
+        ChangeGuard["Agent change limits<br/>≤12 changes · ≤3 new tasks · ≤240 min<br/>critical tasks never deferred or lowered"]
+        OutputGuard["Output checks<br/>made-up citations removed · summary vs changes<br/>pet hazards dropped · vet note"]
+    end
+    Logs[("Logs (logs.py)<br/>data/logs/pawpal.log, keys redacted<br/>sidebar: recent activity")]
+
     subgraph RAG["RAG (rag.py)"]
         GuideStore[("Pet guidelines<br/>user-created, one set per pet")]
         HistoryStore[("Task history<br/>completions, overdue, past schedules<br/>second source")]
@@ -55,6 +63,7 @@ flowchart TD
         RetrievalEval["Retrieval eval<br/>query → expected guideline chunk"]
         SafetyCheck["Plan checks<br/>has_conflicts() is False, required tasks planned"]
         FallbackTests["Fallback tests<br/>rule-based features, provider chain, storage round trip"]
+        GuardTests["Guardrail tests<br/>limits, fencing, citations, hazards, quota, redaction"]
     end
 
     %% Typing a task
@@ -112,6 +121,21 @@ flowchart TD
     Loop -. "AI unavailable" .-> Rules
     Model <--> Storage
 
+    %% Guardrails and logging
+    UI -- "owner text" --> InputGuard --> AI
+    InputGuard --> Agent
+    Quota --- LLM
+    Tools -- "every change" --> ChangeGuard
+    ChangeGuard -- "rejected: reason back to agent" --> Loop
+    Ideas --> OutputGuard
+    Explainer --> OutputGuard
+    Loop --> OutputGuard
+    OutputGuard -- "warnings" --> ReviewPlan
+    LLM -. "calls, timings, failures" .-> Logs
+    Rules -. "fallback reasons" .-> Logs
+    ChangeGuard -. "rejections" .-> Logs
+    Storage -. "load, quarantine" .-> Logs
+
     %% Verification
     UnitTests -.-> Scheduler
     UnitTests -.-> Validate
@@ -122,12 +146,16 @@ flowchart TD
     SafetyCheck -.-> Loop
     FallbackTests -.-> Rules
     FallbackTests -.-> Storage
+    GuardTests -.-> Guard
+    GuardTests -.-> Logs
 
     classDef human fill:#fde68a,stroke:#b45309,color:#000
     classDef test fill:#bbf7d0,stroke:#15803d,color:#000
     classDef ai fill:#ddd6fe,stroke:#6d28d9,color:#000
     classDef data fill:#bae6fd,stroke:#0369a1,color:#000
     class User,ReviewTask,ReviewIdeas,ReviewPlan,ReviewWarn human
-    class UnitTests,MockTests,RetrievalEval,SafetyCheck,FallbackTests test
+    classDef guard fill:#fecaca,stroke:#b91c1c,color:#000
+    class UnitTests,MockTests,RetrievalEval,SafetyCheck,FallbackTests,GuardTests test
     class Parser,Ideas,Explainer,Loop,Tools,Checker,LLM,Rules ai
-    class GuideStore,HistoryStore,Storage data
+    class GuideStore,HistoryStore,Storage,Logs data
+    class InputGuard,Quota,ChangeGuard,OutputGuard guard

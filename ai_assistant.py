@@ -8,16 +8,32 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, TypeVar
 
+from guardrails import (
+    DATA_RULE,
+    MAX_DESCRIPTION_CHARS,
+    MAX_FEEDBACK_CHARS,
+    MAX_GOAL_CHARS,
+    VET_NOTE,
+    as_data,
+    check_change,
+    check_citations,
+    clean_text,
+    find_hazard,
+    needs_vet_note,
+    summary_warnings,
+)
 from llm import LLM, LLMError
 from pawpal_system import Owner, Priority, Schedule, Task, fmt
 from rag import Retriever, describe_task, format_hits
 
 T = TypeVar("T")
+log = logging.getLogger("pawpal.ai")
 
 TIME_FORMATS = ("%H:%M", "%I:%M %p", "%I %p")  # 18:30, 6:30 PM, 6 PM
 NAMED_TIMES = {"noon": time(12, 0), "midnight": time(0, 0)}
@@ -39,17 +55,24 @@ def parse_time(value: Any) -> time | None:
     raise ValueError(f"time must be HH:MM, got {value!r}")
 
 
-def with_fallback(llm: LLM | None, ai_call: Callable[[LLM], T], rules_call: Callable[[], T]) -> tuple[T, str | None]:
+def with_fallback(
+    llm: LLM | None, ai_call: Callable[[LLM], T], rules_call: Callable[[], T], feature: str = "AI feature",
+) -> tuple[T, str | None]:
     """Run `ai_call(llm)`, or the rule-based `rules_call()` when there's no model or the model fails.
 
     Returns (result, note), where note tells the user why the built-in rules were used (None if the AI answered).
+    `feature` names the request in the log.
     """
     if llm is None:
+        log.info("%s: AI is off; using built-in rules", feature)
         return rules_call(), "AI is off, so PawPal+'s built-in rules handled this."
     try:
-        return ai_call(llm), None
+        result = ai_call(llm)
     except LLMError as e:
+        log.warning("%s: falling back to built-in rules (%s)", feature, e)
         return rules_call(), f"The AI couldn't answer ({e}), so PawPal+'s built-in rules handled this."
+    log.info("%s: answered by %s", feature, getattr(llm, "last_used", None) or "the AI")
+    return result, None
 
 
 @dataclass
@@ -125,7 +148,8 @@ PARSE_SYSTEM = f"""You turn a pet owner's description of a care task into struct
 {TASK_FIELDS}
 Use "critical" for words like "critical", "never skip", or "essential", "high" for "important" or "must",
 "low" for "if there's time", and "medium" otherwise.
-Reply with one JSON object containing exactly these fields."""
+Reply with one JSON object containing exactly these fields.
+{DATA_RULE}"""
 
 
 def parse_task(llm: LLM, text: str, owner: Owner) -> TaskDraft:
@@ -133,26 +157,31 @@ def parse_task(llm: LLM, text: str, owner: Owner) -> TaskDraft:
     if not owner.pets:
         raise ValueError("add a pet before adding tasks")
     pets = ", ".join(f"{p.name} ({p.species})" for p in owner.pets)
-    return draft_from_json(llm.generate_json(PARSE_SYSTEM, f"Pets: {pets}\n\nDescription: {text}"), owner)
+    text = clean_text(text, MAX_DESCRIPTION_CHARS)
+    return draft_from_json(llm.generate_json(PARSE_SYSTEM, as_data(f"Pets: {pets}\n\nDescription: {text}")), owner)
 
 
 IDEAS_SYSTEM = f"""You suggest care tasks a pet is missing, based on its species, age, notes, the owner's guidelines, and recent history.
 Do not repeat tasks the pet already has. Prefer tasks that address a guideline or a gap in the history.
 {TASK_FIELDS}
 - "rationale": one sentence on why this pet needs it; cite a source in [brackets] if you used one
-Reply with JSON: {{"ideas": [<task>, ...]}}"""
+Reply with JSON: {{"ideas": [<task>, ...]}}
+{DATA_RULE}"""
 
 
 def suggest_tasks(llm: LLM, owner: Owner, pet, retriever: Retriever, day: date, count: int = 3) -> list[TaskDraft]:
-    """Suggest up to `count` new tasks for `pet`. Invalid ideas and ones the pet already has are dropped."""
+    """Suggest up to `count` new tasks for `pet`.
+
+    Invalid ideas, ones the pet already has, and ones involving something dangerous to pets are dropped.
+    Citations to guidelines that don't exist are removed, and health-related ideas get a note to ask a vet.
+    """
     current = [t for t in pet.tasks if not t.is_completed(day)]
     query = " ".join([pet.species, pet.notes, *pet.guidelines, *(t.title for t in current)])
-    prompt = (
+    prompt = as_data(
         f"Pet: {pet.name}, a {pet.age}-year-old {pet.species}. Notes: {pet.notes or 'none'}\n\n"
         f"Current tasks:\n" + ("\n".join(f"- {describe_task(t, day)}" for t in current) or "- (none)")
-        + f"\n\nGuidelines and history:\n{format_hits(retriever.search(query, pet_name=pet.name, k=8))}\n\n"
-        f"Suggest up to {count} tasks."
-    )
+        + f"\n\nGuidelines and history:\n{format_hits(retriever.search(query, pet_name=pet.name, k=8))}"
+    ) + f"\n\nSuggest up to {count} tasks."
     reply = llm.generate_json(IDEAS_SYSTEM, prompt)
     seen = {t.title.lower() for t in current}
     ideas = []
@@ -161,24 +190,35 @@ def suggest_tasks(llm: LLM, owner: Owner, pet, retriever: Retriever, day: date, 
             draft = draft_from_json({**item, "pet_name": pet.name}, owner) if isinstance(item, dict) else None
         except ValueError:
             continue
-        if draft and draft.title.lower() not in seen:
-            seen.add(draft.title.lower())
-            ideas.append(draft)
+        if not draft or draft.title.lower() in seen:
+            continue
+        if hazard := find_hazard(f"{draft.title} {draft.rationale}"):
+            log.warning("Dropped task idea %r: mentions %s", draft.title, hazard)
+            continue
+        draft.rationale = check_citations(draft.rationale, owner)[0]
+        if needs_vet_note(f"{draft.title} {draft.rationale}"):
+            draft.rationale = f"{draft.rationale} {VET_NOTE}".strip()
+        seen.add(draft.title.lower())
+        ideas.append(draft)
     return ideas[:count]
 
 
 EXPLAIN_SYSTEM = """You explain a pet care schedule to its owner in friendly, plain language.
 Use only the facts provided. Never change times or invent tasks.
 Mention anything that was skipped or moved and why, and give at most two concrete suggestions.
-Keep it under 150 words."""
+Keep it under 150 words.
+""" + DATA_RULE
 
 
 def explain_schedule(llm: LLM, schedule: Schedule, retriever: Retriever) -> str:
-    """Rewrite schedule.explain() for the owner, adding relevant history (e.g. a task skipped on earlier days)."""
+    """Rewrite schedule.explain() for the owner, adding relevant history (e.g. a task skipped on earlier days).
+
+    Citations to guidelines that don't exist are removed from the reply.
+    """
     flagged = [t for t in schedule.reasons if t in schedule.skipped or t.is_overdue(schedule.day) or t in schedule.conflicts]
     history = retriever.search(" ".join(t.label for t in flagged), source="history", k=5) if flagged else []
-    prompt = f"Schedule:\n{schedule.explain()}\n\nRelated history:\n{format_hits(history)}"
-    return llm.generate_text(EXPLAIN_SYSTEM, prompt)
+    prompt = as_data(f"Schedule:\n{schedule.explain()}\n\nRelated history:\n{format_hits(history)}")
+    return check_citations(llm.generate_text(EXPLAIN_SYSTEM, prompt), schedule.owner)[0]
 
 
 # ---- Planning agent ----
@@ -244,7 +284,9 @@ def apply_changes(owner: Owner, changes: list[dict], day: date) -> list[str]:
     trial = copy.deepcopy(owner)
     for change in changes:
         apply_change(trial, change, day)
-    return [apply_change(owner, change, day) for change in changes]
+    descriptions = [apply_change(owner, change, day) for change in changes]
+    log.info("Applied an approved plan for %s: %s", day, " | ".join(descriptions) or "no changes")
+    return descriptions
 
 
 def plan_warnings(schedule: Schedule, changes: list[dict]) -> list[str]:
@@ -304,7 +346,10 @@ Rules:
   lower-priority tasks, and overdue tasks gain priority each day, so raising a priority is often enough.
 - finish only takes effect in a reply with no changes, so you see the schedule your changes produce before finishing.
 - Follow the owner's guidelines and cite them like [Mochi guideline 1] in the summary.
-- Make the fewest changes that meet the goal. If the goal is already met, reply with only finish."""
+- Make the fewest changes that meet the goal. If the goal is already met, reply with only finish.
+- Limits: at most 12 changes and 3 new tasks, tasks up to 240 minutes, available time 15-960 minutes.
+  Critical tasks can't be deferred or lowered; tell the owner instead.
+""" + DATA_RULE
 
 CHANGE_TOOLS = {"set_available_time", "add_task", "update_task", "defer_task"}
 MAX_ACTIONS_PER_TURN = 8
@@ -327,7 +372,9 @@ class PlanningAgent:
         If the model fails on the first turn, the LLMError is raised so the caller can fall back. If it fails
         later, the changes made so far are returned as a proposal with a warning.
         """
+        goal = clean_text(goal, MAX_GOAL_CHARS + MAX_FEEDBACK_CHARS + 60)  # room for feedback appended to the goal
         work = copy.deepcopy(self.owner)
+        log.info("Planning agent started for %s (goal %d chars)", self.day, len(goal))
         history = format_hits(self.retriever.search(
             " ".join([goal, *(t.title for t in work.all_tasks())]), source="history", k=5
         ))
@@ -339,14 +386,19 @@ class PlanningAgent:
                 if turn == 1:
                     raise
                 turn -= 1  # this call produced nothing
+                log.warning("Planning agent: the AI stopped responding after %d turn(s) (%s)", turn, e)
                 warnings.append(f"The AI stopped responding after {turn} turn(s) ({e}). This is its unfinished plan.")
                 break
             reply = reply if isinstance(reply, dict) else {}
             thought = str(reply.get("thought") or "")
             actions = reply.get("actions") if isinstance(reply.get("actions"), list) else [reply] if "tool" in reply else []
             if not actions:
+                log.warning("Planning agent turn %d: reply had no actions", turn)
                 steps.append(AgentStep(turn, thought, "", {}, "error: reply had no actions"))
                 continue
+            log.info("Planning agent turn %d: %d action(s)", turn, len(actions))
+            if len(actions) > MAX_ACTIONS_PER_TURN:
+                log.warning("Planning agent turn %d: ignored %d action(s) over the limit", turn, len(actions) - MAX_ACTIONS_PER_TURN)
             changed, finish = False, None
             for action in actions[:MAX_ACTIONS_PER_TURN]:
                 action = action if isinstance(action, dict) else {}
@@ -365,7 +417,13 @@ class PlanningAgent:
                 summary = str(finish.get("summary") or "").strip()
                 break
         else:
+            log.warning("Planning agent stopped after %d turns without finishing", self.max_turns)
             warnings.append(f"The agent stopped after {self.max_turns} turns without finishing. Review its changes carefully.")
+        summary, removed = check_citations(summary, self.owner)
+        if removed:
+            warnings.append(f"Removed citations to guidelines that don't exist: {', '.join(removed)}.")
+        warnings += summary_warnings(summary, changes)
+        log.info("Planning agent finished: %d turn(s), %d change(s)", turn, len(changes))
         schedule = work.create_schedule(self.day)
         return PlanProposal(
             goal, self.day, changes, schedule, summary, steps,
@@ -381,11 +439,11 @@ class PlanningAgent:
         lines = [
             f"Plan day: {self.day:%A %b %d %Y}",
             f"Pets: {', '.join(f'{p.name} ({p.species}, {p.age})' for p in work.pets)}",
-            f"\nGoal from the owner:\n{goal}",
-            f"\nOwner's guidelines:\n{guidelines}",
-            f"\nRelevant history:\n{history}",
-            f"\nTasks due:\n{due}",
-            f"\nCurrent schedule:\n{work.create_schedule(self.day).explain()}",
+            f"\nGoal from the owner:\n{as_data(goal)}",
+            f"\nOwner's guidelines:\n{as_data(guidelines)}",
+            f"\nRelevant history:\n{as_data(history)}",
+            f"\nTasks due:\n{as_data(due)}",
+            f"\nCurrent schedule:\n{as_data(work.create_schedule(self.day).explain())}",
         ]
         if steps:
             lines.append("\nYour previous actions:")
@@ -394,15 +452,22 @@ class PlanningAgent:
         return "\n".join(lines)
 
     def _call_tool(self, work: Owner, tool: str, args: dict, changes: list[dict]) -> str:
-        """Run one tool against the working copy. Errors are returned as text so the agent can correct itself."""
+        """Run one tool against the working copy. Errors are returned as text so the agent can correct itself.
+
+        Changes must pass the guardrails in check_change as well as Task's own validation.
+        """
         try:
             if tool == "search_guidelines":
                 return format_hits(self.retriever.search(str(args.get("query") or ""), pet_name=args.get("pet_name") or None, k=5))
             if tool in CHANGE_TOOLS:
                 change = {"tool": tool, "args": args}
+                check_change(work, change, changes, self.day)
                 change["description"] = apply_change(work, change, self.day)
                 changes.append(change)
+                log.info("Planning agent: %s", change["description"])
                 return f"done: {change['description']}"
+            log.warning("Planning agent asked for unknown tool %r", tool)
             return f"error: unknown tool {tool!r}"
         except (TypeError, ValueError) as e:
+            log.warning("Planning agent: rejected %s %s (%s)", tool, json.dumps(args)[:200], e)
             return f"error: {e}"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 from enum import IntEnum
@@ -12,6 +13,8 @@ FREQUENCY_DAYS = {"daily": 1, "weekly": 7}
 
 MINUTES_PER_DAY = 24 * 60
 PACKING_NODE_LIMIT = 20_000  # search steps best-fit packing may take before keeping the best arrangement found
+
+log = logging.getLogger("pawpal.scheduler")
 
 
 class Priority(IntEnum):
@@ -327,6 +330,11 @@ class Schedule:
             if task.is_overdue(self.day):
                 self.reasons[task] = f"{reason} (overdue since {task.start_date:%a %b %d})"
 
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("Schedule %s: %d planned, %d skipped, %d moved", self.day, len(self.planned), len(self.skipped), len(self.conflicts))
+            for task in self.skipped:
+                log.debug("Skipped %s: %s", task.label, self.reasons[task])
+
     def _place(self, tasks: list[Task]) -> None:
         """Clear any previous plan and place `tasks` (already ranked): fixed ones first, then flexible ones."""
         self.planned.clear()
@@ -590,6 +598,7 @@ class Schedule:
                 continue
 
             labels = ", ".join(victim.label for _, victim in removed)
+            log.debug("%s bumped %s", task.label, labels)
             self.skipped.remove(task)
             self._no_room.discard(task)
             self.conflicts.pop(task, None)

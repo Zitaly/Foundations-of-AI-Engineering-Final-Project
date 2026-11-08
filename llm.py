@@ -9,6 +9,7 @@ to its built-in rules.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -32,6 +33,8 @@ MAX_OUTPUT_TOKENS = 1024  # every PawPal+ reply is short; capping it keeps token
 GROQ_MAX_TOKENS = 2048  # Groq's models reason before answering, and reasoning counts toward this
 CACHE_SIZE = 128
 CACHE_DIR = Path(os.environ.get("PAWPAL_CACHE_DIR", Path(__file__).parent / "data" / "ai_cache"))
+
+log = logging.getLogger("pawpal.llm")  # prompts are never logged, only sizes, models, timings, and outcomes
 
 
 def retry_delay(error: Exception) -> float:
@@ -124,7 +127,8 @@ class HostedLLM:
         try:
             for mime_type, system, prompt, text in json.loads(self._cache_path.read_text(encoding="utf-8"))[-CACHE_SIZE:]:
                 self._cache[(mime_type, system, prompt)] = text
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as e:
+            log.warning("%s reply cache ignored (%s)", self.provider, e)
             self._cache.clear()
 
     def _save_cache(self) -> None:
@@ -136,8 +140,8 @@ class HostedLLM:
             temp = self._cache_path.with_suffix(".tmp")
             temp.write_text(json.dumps([[*key, text] for key, text in self._cache.items()]), encoding="utf-8")
             os.replace(temp, self._cache_path)
-        except OSError:
-            pass
+        except OSError as e:
+            log.warning("%s reply cache not saved (%s)", self.provider, e)
 
     def _forget(self, key: tuple[str, str, str]) -> None:
         if self._cache.pop(key, None) is not None:
@@ -157,6 +161,7 @@ class HostedLLM:
         if key in self._cache:
             self._cache.move_to_end(key)
             self.cache_hits += 1
+            log.info("%s answered from cache (%s)", self.provider, mime_type)
             return self._cache[key]
         text = self._request(system, prompt, mime_type)
         self._cache[key] = text
@@ -175,27 +180,39 @@ class HostedLLM:
                     continue
                 self._sent[model].append(time.monotonic())
                 self.request_count += 1
+                started = time.monotonic()
                 try:
                     text = self._call(model, system, prompt, mime_type)
                 except Exception as e:  # the SDKs raise several error types; surface them all the same way
                     code = getattr(e, "code", None)
                     if code in MISSING_CODES:
                         self._busy_until[model] = math.inf
+                        log.warning("%s %s not found (HTTP %s); skipping it this session", self.provider, model, code)
                     elif code in BUSY_CODES or is_timeout(e):
-                        self._busy_until[model] = time.monotonic() + retry_delay(e)
+                        delay = retry_delay(e)
+                        self._busy_until[model] = time.monotonic() + delay
+                        log.warning("%s %s busy (%s); cooling down %.0f s", self.provider, model,
+                                    f"HTTP {code}" if code else "timeout", delay)
                     else:
+                        log.error("%s %s request failed: %s", self.provider, model, e)
                         raise LLMError(f"{self.provider} request failed: {e}") from e
                     last_error = f"{model}: {e}"
                     continue
+                elapsed = time.monotonic() - started
                 if text:
+                    log.info("%s %s answered in %.1f s (%s, prompt %d chars, reply %d chars)",
+                             self.provider, model, elapsed, mime_type, len(system) + len(prompt), len(text))
                     return text
                 blocked.add(model)
+                log.warning("%s %s returned an empty or unusable reply after %.1f s", self.provider, model, elapsed)
                 last_error = f"{model} returned an empty or unusable response"
             ready = [self._ready_at(m, time.monotonic()) for m in self.models if m not in blocked]
             wait = min(ready, default=math.inf) - time.monotonic()
             if wait > self.max_wait:
                 break
+            log.info("%s: every model busy; waiting %.0f s", self.provider, max(wait, 0))
             time.sleep(max(wait, 0))
+        log.warning("No %s model could answer (last problem: %s)", self.provider, last_error)
         raise LLMError(f"No {self.provider} model could answer right now (last problem: {last_error}).")
 
     def generate_text(self, system: str, prompt: str) -> str:
@@ -207,6 +224,7 @@ class HostedLLM:
         try:
             return parse_json(self._generate(system, prompt, "application/json"))
         except LLMError as e:
+            log.warning("%s returned invalid JSON; asking once more (%s)", self.provider, e)
             self._forget(("application/json", system, prompt))
             repair = f"{prompt}\n\nYour previous reply was not valid JSON ({e}). Reply again with only the JSON."
             try:
@@ -327,6 +345,7 @@ class FallbackLLM:
                 result = getattr(provider, method)(system, prompt)
             except LLMError as e:
                 problems.append(str(e))
+                log.warning("%s failed; trying the next provider", provider.provider)
                 continue
             self.last_used = provider.name
             return result

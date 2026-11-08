@@ -11,7 +11,20 @@ import streamlit as st
 import storage
 from ai_assistant import PlanningAgent, TaskDraft, apply_changes, explain_schedule, parse_task, suggest_tasks, with_fallback
 from export import schedule_rows, schedule_to_ics
+from guardrails import (
+    MAX_DESCRIPTION_CHARS,
+    MAX_FEEDBACK_CHARS,
+    MAX_GOAL_CHARS,
+    MAX_GUIDELINES_CHARS,
+    MAX_NAME_CHARS,
+    MAX_NOTES_CHARS,
+    MAX_TITLE_CHARS,
+    VET_DISCLAIMER,
+    QuotaLLM,
+    SessionQuota,
+)
 from llm import FallbackLLM, GeminiLLM, GroqLLM, LLMError, get_api_key, get_groq_key
+from logs import recent, setup_logging
 from offline import (
     check_guidelines_rules,
     explain_schedule_rules,
@@ -24,6 +37,7 @@ from pawpal_system import PRIORITY_NAMES, Owner, Pet, Priority, Schedule, Task, 
 from rag import Retriever, build_documents, check_guidelines
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="wide")
+setup_logging()  # once per process; later reruns reuse it
 
 PRIORITY_COLORS = {"Critical": "#c92a2a", "High": "#e8590c", "Medium": "#1c7ed6", "Low": "#868e96"}
 PRIORITY_BADGES = {"Critical": "🔴 Critical", "High": "🟠 High", "Medium": "🔵 Medium", "Low": "⚪ Low"}
@@ -104,12 +118,14 @@ def make_llm(gemini_key: str | None, groq_key: str | None) -> tuple[FallbackLLM 
     return (FallbackLLM(providers) if providers else None), problems
 
 
-llm, llm_problems = make_llm(secret("GEMINI_API_KEY", get_api_key()), secret("GROQ_API_KEY", get_groq_key()))
+shared_llm, llm_problems = make_llm(secret("GEMINI_API_KEY", get_api_key()), secret("GROQ_API_KEY", get_groq_key()))
+quota: SessionQuota = st.session_state.setdefault("ai_quota", SessionQuota())
+llm = QuotaLLM(shared_llm, quota) if shared_llm else None  # each session gets its own request allowance
 
 
-def ai_or_rules(ai_call, rules_call) -> tuple:
+def ai_or_rules(feature: str, ai_call, rules_call) -> tuple:
     """Run an AI feature with the built-in rules as fallback. Returns (result, caption saying who answered)."""
-    result, note = with_fallback(llm, ai_call, rules_call)
+    result, note = with_fallback(llm, ai_call, rules_call, feature)
     return result, note or f"Answered by {llm.last_used}."
 
 # ---- Sidebar: the day and the owner's settings ----
@@ -162,9 +178,18 @@ with st.sidebar:
                 f"{provider.cache_hits} from cache, paced to {provider.rpm}/min per model. "
                 f"Backup models: {', '.join(provider.models[1:]) or 'none'}."
             )
+        st.progress(
+            min(quota.used / quota.limit, 1.0) if quota.limit else 1.0,
+            text=f"AI requests this session: {quota.used} of {quota.limit}",
+        )
     else:
         st.info("No AI keys found, so AI features use PawPal+'s built-in rules. Set GEMINI_API_KEY or GROQ_API_KEY to use AI.")
     st.caption("If every AI provider is unavailable, the built-in rules take over. Every suggestion waits for your review.")
+    with st.expander("Recent activity"):
+        if recent.lines:
+            st.code("\n".join(reversed(recent.lines)), language=None, wrap_lines=True)
+        else:
+            st.caption("Nothing logged yet.")
 
 # ---- Header and day summary ----
 
@@ -284,11 +309,11 @@ with pets_tab:
     with add_col:
         st.subheader("Add a pet")
         with st.form("add_pet", clear_on_submit=True):
-            pet_name = st.text_input("Name", placeholder="Mochi")
+            pet_name = st.text_input("Name", placeholder="Mochi", max_chars=MAX_NAME_CHARS)
             col1, col2 = st.columns(2)
             species = col1.selectbox("Species", ["dog", "cat", "other"])
             pet_age = col2.number_input("Age (years)", min_value=0, max_value=40, value=3)
-            pet_notes = st.text_input("Notes (optional)", placeholder="Senior, sensitive stomach")
+            pet_notes = st.text_input("Notes (optional)", placeholder="Senior, sensitive stomach", max_chars=MAX_NOTES_CHARS)
             if st.form_submit_button("Add pet", type="primary", width="stretch"):
                 try:
                     if not pet_name.strip():
@@ -321,11 +346,13 @@ with pets_tab:
                 "and \"Brush coat twice a week\"."
             )
             edit_pet = pets_by_name[st.selectbox("Pet", list(pets_by_name), key="guideline_pet")]
-            notes_text = st.text_input("Notes", value=edit_pet.notes, key=f"notes_{edit_pet.name}")
+            notes_text = st.text_input("Notes", value=edit_pet.notes[:MAX_NOTES_CHARS], key=f"notes_{edit_pet.name}",
+                                       max_chars=MAX_NOTES_CHARS)
             guideline_text = st.text_area(
                 "Guidelines (one per line)",
-                value="\n".join(edit_pet.guidelines),
+                value="\n".join(edit_pet.guidelines)[:MAX_GUIDELINES_CHARS],
                 key=f"guidelines_{edit_pet.name}",
+                max_chars=MAX_GUIDELINES_CHARS,
                 placeholder="At least 60 minutes of walks a day\nMedication must be given before 09:00",
             )
             save_col, remove_col = st.columns([1, 1])
@@ -423,12 +450,13 @@ with tasks_tab:
             nl_text = st.text_input(
                 "Description", label_visibility="collapsed",
                 placeholder="Walk Mochi for 30 minutes every morning at 7:30, it's important",
+                max_chars=MAX_DESCRIPTION_CHARS,
             )
             if st.button("Draft task", disabled=not nl_text.strip()):
                 try:
                     with st.spinner("Drafting..."):
                         st.session_state.task_draft = ai_or_rules(
-                            lambda m: parse_task(m, nl_text, owner), lambda: parse_task_rules(nl_text, owner)
+                            "Draft task", lambda m: parse_task(m, nl_text, owner), lambda: parse_task_rules(nl_text, owner)
                         )
                 except ValueError as e:
                     st.error(f"Couldn't draft that task: {e}")
@@ -442,7 +470,7 @@ with tasks_tab:
                     pet_names = list(pets_by_name)
                     col1, col2, col3 = st.columns(3)
                     draft_pet = col1.selectbox("Pet", pet_names, index=pet_names.index(draft.pet_name) if draft.pet_name in pet_names else 0)
-                    draft_title = col2.text_input("Task", value=draft.title)
+                    draft_title = col2.text_input("Task", value=draft.title[:MAX_TITLE_CHARS], max_chars=MAX_TITLE_CHARS)
                     draft_duration = col3.number_input("Minutes", min_value=1, max_value=240, value=min(draft.duration_minutes, 240))
                     col1, col2, col3 = st.columns(3)
                     draft_priority = col1.selectbox("Priority", PRIORITY_NAMES, index=PRIORITY_NAMES.index(draft.priority))
@@ -474,7 +502,7 @@ with tasks_tab:
             with st.form("add_task", clear_on_submit=True, border=True):
                 col1, col2 = st.columns(2)
                 task_pet = col1.selectbox("Pet", list(pets_by_name))
-                task_title = col2.text_input("Task", placeholder="Morning walk")
+                task_title = col2.text_input("Task", placeholder="Morning walk", max_chars=MAX_TITLE_CHARS)
                 col1, col2, col3 = st.columns(3)
                 duration = col1.number_input("Minutes", min_value=1, max_value=240, value=20)
                 priority = col2.selectbox("Priority", PRIORITY_NAMES, index=PRIORITY_NAMES.index("medium"))
@@ -571,12 +599,13 @@ with tasks_tab:
         ideas_col, check_col = st.columns(2, gap="large")
         with ideas_col:
             st.subheader("Task ideas")
-            st.caption("Suggestions based on the pet's species, age, notes, your guidelines, and recent history.")
+            st.caption(f"Suggestions based on the pet's species, age, notes, your guidelines, and recent history. {VET_DISCLAIMER}")
             idea_pet = st.selectbox("Ideas for", list(pets_by_name), key="idea_pet")
             if st.button("Suggest tasks"):
                 pet, retriever = pets_by_name[idea_pet], build_retriever()
                 with st.spinner("Thinking of ideas..."):
                     st.session_state.ideas, st.session_state.ideas_note = ai_or_rules(
+                        "Task ideas",
                         lambda m: suggest_tasks(m, owner, pet, retriever, view_day),
                         lambda: suggest_tasks_rules(owner, pet, retriever, view_day),
                     )
@@ -604,6 +633,7 @@ with tasks_tab:
             if st.button("Check tasks", disabled=not has_guidelines):
                 with st.spinner("Checking..."):
                     issues, note = ai_or_rules(
+                        "Guideline check",
                         lambda m: check_guidelines(m, owner, build_retriever(), view_day),
                         lambda: check_guidelines_rules(owner, view_day),
                     )
@@ -653,13 +683,14 @@ with schedule_tab:
             if st.button("Explain this plan"):
                 with st.spinner("Explaining..."):
                     text, note = ai_or_rules(
-                        lambda m: explain_schedule(m, schedule, build_retriever()), lambda: explain_schedule_rules(schedule)
+                        "Explain plan",
+                        lambda m: explain_schedule(m, schedule, build_retriever()), lambda: explain_schedule_rules(schedule),
                     )
                 st.session_state.ai_explanation = (view_day, text, note)
             explanation = st.session_state.get("ai_explanation")
             if explanation and explanation[0] == view_day:
                 st.info(explanation[1])
-                st.caption(f"{explanation[2]} The table above is the source of truth.")
+                st.caption(f"{explanation[2]} The table above is the source of truth. {VET_DISCLAIMER}")
             with st.expander("Scheduler's step-by-step reasoning"):
                 st.code(schedule.explain(), language=None)
         else:
@@ -673,6 +704,7 @@ def run_planner(goal_text: str) -> None:
     retriever = build_retriever()
     with st.spinner("Planning..."):
         st.session_state.proposal, st.session_state.proposal_note = ai_or_rules(
+            "Plan my day",
             lambda m: PlanningAgent(m, owner, view_day, retriever).run(goal_text),
             lambda: plan_rules(owner, view_day, goal_text),
         )
@@ -688,6 +720,7 @@ with planner_tab:
         "What should the plan achieve?",
         placeholder="I only have 60 minutes today. Make sure medication and feeding still happen.",
         key="agent_goal",
+        max_chars=MAX_GOAL_CHARS,
     )
     if st.button("Draft a plan", type="primary", disabled=not goal.strip() or not owner.all_tasks()):
         run_planner(goal)
@@ -736,7 +769,8 @@ with planner_tab:
             st.session_state.pop("proposal")
             st.rerun()
 
-        feedback = st.text_input("Or tell the planner what to change", placeholder="Keep Fetch, defer brushing instead")
+        feedback = st.text_input("Or tell the planner what to change", placeholder="Keep Fetch, defer brushing instead",
+                                 max_chars=MAX_FEEDBACK_CHARS)
         if st.button("Revise with feedback", disabled=not feedback.strip()):
             run_planner(f"{proposal.goal}\n\nFeedback on your previous proposal: {feedback}")
             st.rerun()

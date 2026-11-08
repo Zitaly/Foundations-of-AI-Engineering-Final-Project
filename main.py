@@ -6,6 +6,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from logs import setup_logging
 from pawpal_system import Owner, Pet, Priority, Schedule, Task, add_minutes, fmt
 
 console = Console()
@@ -58,6 +59,7 @@ def print_schedule(schedule: Schedule) -> None:
 
 
 def main() -> None:
+    setup_logging(log_dir=None)  # warnings only, on the console; the demo leaves no log file behind
     today = date.today()
 
     owner = Owner("Jordan", available_minutes=180, day_start=time(7, 0))
