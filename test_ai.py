@@ -594,3 +594,24 @@ def test_agent_can_set_window_and_order():
     fetch = owner.pets[0].tasks[1]
     assert (fetch.not_before, fetch.done_by, fetch.after, fetch.after_gap_minutes) == (time(9, 0), time(10, 0), "Morning walk", 10)
     assert "not_before → 09:00" in descriptions[0]
+
+
+def test_provider_failure_does_not_send_a_json_repair_request():
+    from llm import HostedLLM
+
+    class Busy(HostedLLM):
+        provider = "Busy"
+
+        def __init__(self):
+            super().__init__(["m"], rpm=100, temperature=0, cache_dir=None)
+            self.max_wait = 0
+            self.prompts = []
+
+        def _call(self, model, system, prompt, mime_type):
+            self.prompts.append(prompt)
+            raise APIError(429, "quota exceeded")
+
+    llm = Busy()
+    with pytest.raises(LLMError, match="No Busy model could answer"):
+        llm.generate_json("s", "p")
+    assert llm.prompts == ["p"]  # no "reply again with only the JSON" request after a failure

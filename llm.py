@@ -220,9 +220,13 @@ class HostedLLM:
         return self._generate(system, prompt, "text/plain").strip()
 
     def generate_json(self, system: str, prompt: str) -> Any:
-        """Return a reply parsed as JSON. An invalid reply is dropped from the cache and asked for once more."""
+        """Return a reply parsed as JSON. An invalid reply is dropped from the cache and asked for once more.
+
+        Provider failures raise straight away; only a reply that arrived but isn't JSON gets the repair request.
+        """
+        text = self._generate(system, prompt, "application/json")
         try:
-            return parse_json(self._generate(system, prompt, "application/json"))
+            return parse_json(text)
         except LLMError as e:
             log.warning("%s returned invalid JSON; asking once more (%s)", self.provider, e)
             self._forget(("application/json", system, prompt))
